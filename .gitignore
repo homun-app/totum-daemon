@@ -1,0 +1,24 @@
+# Secrets and local configuration
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Rust build output
+target/
+coverage/
+
+# Private product and visual reference material
+totum-design/
+**/totum-design/
+.lovable/
+**/.lovable/
+.playwright-mcp/
+node_modules/
+output/
