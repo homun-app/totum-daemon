@@ -122,3 +122,28 @@ jobs:
           CI="${CI:-}"
           RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT:-}"
           .github/scripts/tb08-linux.sh "$PWD/target/debug/totum-daemon"
+
+  process-lifecycle:
+    name: SIGTERM e stato del processo (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Build the daemon
+        run: cargo build -p totum-daemon --bin totum-daemon --locked
+      - name: Observe exit status as the runner user
+        run: python3 .github/scripts/process-lifecycle.py "$PWD/target/debug/totum-daemon"
+      - name: Observe exit status across UIDs without creating accounts
+        run: >-
+          sudo env
+          GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          TOTUM_PROCESS_LIFECYCLE_CI=1
+          python3 .github/scripts/process-lifecycle.py
+          "$PWD/target/debug/totum-daemon" --ci-root

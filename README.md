@@ -121,3 +121,5 @@ Questo repository è dedicato al daemon. L’app mobile, il design system, il re
 ## Licenza
 
 La licenza del daemon non è ancora stata scelta dal proprietario. La visibilità pubblica non equivale all’assegnazione di una licenza open source; nessuna licenza di altri prodotti Homun viene applicata automaticamente. I pacchetti dichiarano `publish = false`.
+
+La [verifica dello stato del processo](docs/process-lifecycle.md) aggiunge il job `process-lifecycle` su macOS e Linux: SIGTERM con stato grezzo, controllo negativo per `SIGCHLD` ignorato e ripristino dell’osservatore, sia come utente del runner sia fra UID diversi. Non crea account e non copre il login grafico.
