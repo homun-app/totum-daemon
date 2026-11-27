@@ -115,7 +115,7 @@ Le prove della libreria coprono:
 
 ## Limiti
 
-- Le prove sono state eseguite soltanto su macOS. Le prove d'integrazione compilano per `x86_64-pc-windows-gnu` e sono assegnate al job `windows-non-elevated`, che nella CI del 27 novembre 2026 si è fermato prima delle prove, e nessuna esecuzione Windows o Linux delle prove di stato è stata fatta; i reparse point e il riconoscimento Windows dell'arresto (`0xC0000409`) sono verificati soltanto in compilazione. La matrice `rust` non esegue le prove di stato su Windows, dove il runner è amministratore.
+- Le prove sono eseguite su macOS e nella suite Linux della seconda CI. Su Windows compilano, ma il job non elevato è andato in timeout nella precedente suite `config`: identità, reparse point e riconoscimento Windows di `0xC0000409` restano privi di esecuzione verificata. La matrice Rust Windows esclude le prove di stato; vedere [le evidenze CI](ci-verification.md).
 - ACL effettive, isolamento fra account e un `identity.json` posseduto da un altro account richiedono privilegi o un secondo account e non sono stati provati. Un file con proprietario errato è un rifiuto per costruzione, non una prova eseguita.
 - La durabilità alla perdita di alimentazione non è provata.
 - Il lock è consultivo e non copre processi che lo ignorano.

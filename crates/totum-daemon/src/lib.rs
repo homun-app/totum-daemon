@@ -22,3 +22,6 @@ pub mod config;
 pub mod identity;
 pub mod platform;
 pub mod startup;
+
+#[cfg(test)]
+mod test_support;

@@ -61,6 +61,30 @@ function Get-JsonProperty {
 function Stop-ProcessTree {
     param([Parameter(Mandatory = $true)][int] $ProcessId)
     & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+    Write-Host "taskkill: pid=$ProcessId uscita=$LASTEXITCODE"
+}
+
+function Show-ProcessTree {
+    param([Parameter(Mandatory = $true)][int] $ProcessId)
+    # Non leggere CommandLine o l'ambiente: possono contenere credenziali.
+    $root = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($root) {
+        Write-Host "processo: pid=$($root.Id) nome=$($root.ProcessName) cpu=$($root.CPU) handles=$($root.HandleCount)"
+    }
+    if ($IsWindows) {
+        $snapshot = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name -OperationTimeoutSec 10)
+        $pending = [System.Collections.Generic.Queue[int]]::new()
+        $seen = [System.Collections.Generic.HashSet[int]]::new()
+        $pending.Enqueue($ProcessId)
+        while ($pending.Count -gt 0) {
+            $parent = $pending.Dequeue()
+            if (-not $seen.Add($parent)) { continue }
+            foreach ($child in $snapshot | Where-Object { $_.ParentProcessId -eq $parent }) {
+                Write-Host "figlio: pid=$($child.ProcessId) padre=$parent nome=$($child.Name)"
+                $pending.Enqueue([int]$child.ProcessId)
+            }
+        }
+    }
 }
 
 function Show-Output {
@@ -71,6 +95,46 @@ function Show-Output {
             if ($text) { Write-Host $text.TrimEnd() }
         }
     }
+}
+
+function Wait-CapturedProcess {
+    param(
+        [Parameter(Mandatory = $true)] $Process,
+        [Parameter(Mandatory = $true)][string] $Label,
+        [Parameter(Mandatory = $true)][string] $StdOut,
+        [Parameter(Mandatory = $true)][string] $StdErr,
+        [Parameter(Mandatory = $true)][int] $TimeoutSeconds,
+        [switch] $Progress
+    )
+    $result = [pscustomobject]@{ ExitCode = $null; StdOut = $StdOut; StdErr = $StdErr }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $nextReport = 30
+    Write-Host "avvio: $Label pid=$($Process.Id) limite=${TimeoutSeconds}s"
+    while (-not $Process.WaitForExit(1000)) {
+        if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            try { Show-ProcessTree -ProcessId $Process.Id }
+            catch { Write-Host "diagnostica processi non disponibile: $($_.Exception.Message)" }
+            try { Stop-ProcessTree -ProcessId $Process.Id }
+            catch { Write-Host "terminazione fallita: $($_.Exception.Message)" }
+            finally {
+                $terminated = $Process.WaitForExit(10000)
+                Write-Host "termine dopo timeout: pid=$($Process.Id) terminato=$terminated"
+                # Stampare anche quando la terminazione fallisce: il chiamante
+                # non ricevera' il risultato dopo l'eccezione.
+                Show-Output -Result $result
+            }
+            throw "timeout di $TimeoutSeconds secondi per $Label"
+        }
+        if ($Progress -and $clock.Elapsed.TotalSeconds -ge $nextReport) {
+            Write-Host "in corso: $Label pid=$($Process.Id) secondi=$([int]$clock.Elapsed.TotalSeconds)"
+            foreach ($path in @($StdOut, $StdErr)) {
+                if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Tail 20 | ForEach-Object { Write-Host $_ } }
+            }
+            $nextReport += 30
+        }
+    }
+    $result.ExitCode = $Process.ExitCode
+    return $result
 }
 
 function Invoke-Captured {
@@ -84,16 +148,7 @@ function Invoke-Captured {
     $stdout = Join-Path $script:logDir "$Label.out"
     $stderr = Join-Path $script:logDir "$Label.err"
     $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        Stop-ProcessTree -ProcessId $process.Id
-        $process.WaitForExit(10000) | Out-Null
-        throw "timeout di $TimeoutSeconds secondi per $Label"
-    }
-    return [pscustomobject]@{
-        ExitCode = $process.ExitCode
-        StdOut   = $stdout
-        StdErr   = $stderr
-    }
+    return Wait-CapturedProcess -Process $process -Label $Label -StdOut $stdout -StdErr $stderr -TimeoutSeconds $TimeoutSeconds
 }
 
 function Invoke-AsUser {
@@ -106,16 +161,33 @@ function Invoke-AsUser {
     $stdout = Join-Path $script:logDir "$Label.out"
     $stderr = Join-Path $script:logDir "$Label.err"
     $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Credential $script:credential -LoadUserProfile -WorkingDirectory $script:workRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        Stop-ProcessTree -ProcessId $process.Id
-        $process.WaitForExit(10000) | Out-Null
-        throw "timeout di $TimeoutSeconds secondi per $Label"
-    }
-    return [pscustomobject]@{
-        ExitCode = $process.ExitCode
-        StdOut   = $stdout
-        StdErr   = $stderr
-    }
+    return Wait-CapturedProcess -Process $process -Label $Label -StdOut $stdout -StdErr $stderr -TimeoutSeconds $TimeoutSeconds -Progress
+}
+
+function Remove-OwnedTestSource {
+    # Le radici del daemon hanno DACL per il solo account di prova. Rimuoverle
+    # con quel token PRIMA di cancellare l'account, senza indebolire le ACL.
+    if (-not $script:workRootCreated -or -not $script:userName -or -not $script:credential) { return }
+    $source = Join-Path $script:workRoot 'src'
+    if (-not (Test-Path -LiteralPath $source)) { return }
+    $qualified = "$env:COMPUTERNAME\$($script:userName)"
+    & taskkill.exe /FI "USERNAME eq $qualified" /T /F 2>$null | Out-Null
+    Write-Host "arresto processi dell'account effimero: uscita=$LASTEXITCODE"
+    $literal = $source.Replace("'", "''")
+    $cleanup = @"
+`$ErrorActionPreference = 'Stop'
+`$source = '$literal'
+Get-ChildItem -LiteralPath `$source -Recurse -Force | ForEach-Object { `$_.Attributes = [System.IO.FileAttributes]::Normal }
+Remove-Item -LiteralPath `$source -Recurse -Force
+if (Test-Path -LiteralPath `$source) { throw 'sorgente di prova non rimossa' }
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cleanup))
+    $result = Invoke-AsUser -Label 'cleanup-source' -FilePath (Get-Process -Id $PID).Path -Arguments @(
+        '-NoLogo', '-NoProfile', '-EncodedCommand', $encoded
+    ) -TimeoutSeconds 60
+    Show-Output -Result $result
+    if ($result.ExitCode -ne 0) { throw "pulizia con l'account di prova fallita: $($result.ExitCode)" }
+    Write-Host 'sorgente di prova rimossa con il suo proprietario'
 }
 
 function Set-TreeOwner {
@@ -387,7 +459,7 @@ try {
     $failures = [System.Collections.Generic.List[string]]::new()
     foreach ($suite in @('config', 'identity', 'lock', 'platform_windows', 'startup', 'totum_daemon')) {
         Write-Phase "Esecuzione $suite"
-        $result = Invoke-AsUser -Label "test-$suite" -FilePath $testArtifacts[$suite] -Arguments @('--skip', 'real_backend') -TimeoutSeconds $StepTimeoutSeconds
+        $result = Invoke-AsUser -Label "test-$suite" -FilePath $testArtifacts[$suite] -Arguments @('--skip', 'real_backend', '--nocapture', '--format', 'pretty', '--color', 'never') -TimeoutSeconds $StepTimeoutSeconds
         Show-Output -Result $result
         if ($result.ExitCode -ne 0) {
             $failures.Add($suite)
@@ -409,6 +481,13 @@ catch {
 }
 finally {
     Write-Phase 'Pulizia'
+    try {
+        Remove-OwnedTestSource
+    }
+    catch {
+        $script:exitCode = 1
+        Write-Host "ERRORE DI PULIZIA DELLA SORGENTE: $($_.Exception.Message)" -ForegroundColor Red
+    }
     try {
         Remove-EphemeralAccount
     }

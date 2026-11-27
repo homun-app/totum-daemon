@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use super::write::{self, Step, create_temporary_with, fault};
 use super::{CONTROLLERS_FILE, IDENTITY_FILE};
 use crate::platform::{self, VerifiedRoot};
+use crate::test_support::spawn;
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
@@ -319,15 +320,16 @@ fn is_expected_crash(status: &ExitStatus) -> bool {
 
 fn run_child(scenario: &str, base: &Path) -> ExitStatus {
     let exe = std::env::current_exe().expect("binario di prova");
-    let mut child = Command::new(exe)
-        .args(["--ignored", "--exact", CRASH_TEST])
-        .env(CRASH_ENV, scenario)
-        .env(CRASH_DIR_ENV, base)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("processo figlio avviato");
+    let mut child = spawn(
+        Command::new(exe)
+            .args(["--ignored", "--exact", CRASH_TEST])
+            .env(CRASH_ENV, scenario)
+            .env(CRASH_DIR_ENV, base)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("processo figlio avviato");
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {

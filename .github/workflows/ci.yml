@@ -59,6 +59,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup show
+      - name: Self-test timeout diagnostics without account changes
+        run: pwsh -NoLogo -NoProfile -File ./.github/scripts/windows-harness-selftest.ps1
       - name: Run the state tests with a verified standard-user token
         run: >-
           pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass

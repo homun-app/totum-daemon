@@ -11,7 +11,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -24,6 +23,7 @@ use super::{
     GenerationFailure, MigrationSource, StartupKind, Store,
 };
 use crate::platform::{self, VerifiedRoot};
+use crate::test_support::{fork_window, spawn};
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
@@ -138,22 +138,6 @@ fn open_with_startup(root: VerifiedRoot) -> (Store, super::Startup) {
 fn open_store(root: VerifiedRoot) -> (Store, StartupKind) {
     let (store, startup) = open_with_startup(root);
     (store, startup.kind)
-}
-
-/// Coordinazione dell'harness fra avvio dei processi figli di arresto e
-/// transizioni del lock.
-///
-/// Un figlio forchettato eredita i descrittori del padre finché non esegue;
-/// `flock` resta legato alla open file description, quindi un riferimento
-/// ereditato ritarda il rilascio anche dopo che il padre ha chiuso il proprio
-/// descrittore. Le prove di arresto avviano figli dallo stesso binario di prova:
-/// chi rilascia e riacquisisce un lock prende questo mutex, che
-/// [`run_crash_child`] tiene durante la `spawn` (che attende `exec`). Il
-/// prodotto non crea processi e non ha bisogno di questa coordinazione.
-static FORKS: Mutex<()> = Mutex::new(());
-
-fn fork_window() -> MutexGuard<'static, ()> {
-    FORKS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[test]
@@ -890,18 +874,16 @@ fn crash_child() {
 /// resta al `Drop` di [`Scratch`] del processo padre.
 fn run_crash_child(scenario: &str, base: &Path) {
     let exe = std::env::current_exe().expect("binario di prova");
-    let mut child = {
-        let _forks = fork_window();
+    let mut child = spawn(
         Command::new(exe)
             .args(["--ignored", "--exact", CRASH_TEST])
             .env(CRASH_ENV, scenario)
             .env(CRASH_DIR_ENV, base)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("processo figlio avviato")
-    };
+            .stderr(Stdio::null()),
+    )
+    .expect("processo figlio avviato");
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
