@@ -827,7 +827,7 @@ fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .map(|name| {
             let path = directory.join(&name);
-            let bytes = if fs::symlink_metadata(&path).unwrap().is_file() {
+            let bytes = if name != LOCK_FILE && fs::symlink_metadata(&path).unwrap().is_file() {
                 fs::read(&path).expect("file leggibile")
             } else {
                 Vec::new()

@@ -70,6 +70,34 @@ fn present_file_is_reopened_with_its_contents() {
 }
 
 #[test]
+fn replacement_preserves_an_open_reader_and_publishes_the_new_generation() {
+    let base = scratch("win-open-reader-replace");
+    let root = platform::prepare_root(&base.join("Totum")).expect("radice preparabile");
+    for (name, bytes) in [
+        ("config.json", b"previous".as_slice()),
+        ("pending.tmp", b"next".as_slice()),
+    ] {
+        let mut file = root.create_file(OsStr::new(name)).expect("file creato");
+        file.write_all(bytes).expect("contenuto scritto");
+        file.sync_all().expect("contenuto sincronizzato");
+    }
+    // Il vecchio handle resta aperto per l'intera sostituzione: nessuna race
+    // o attesa rende intermittente questa regressione di MoveFileExW.
+    let mut previous = root
+        .open_file(OsStr::new("config.json"))
+        .expect("lettore aperto");
+    root.replace_file(OsStr::new("pending.tmp"), OsStr::new("config.json"))
+        .expect("sostituzione con lettore aperto");
+    let mut old_bytes = Vec::new();
+    previous
+        .read_to_end(&mut old_bytes)
+        .expect("vecchio handle leggibile");
+    assert_eq!(old_bytes, b"previous");
+    assert_eq!(fs::read(root.path().join("config.json")).unwrap(), b"next");
+    assert!(!root.path().join("pending.tmp").exists());
+}
+
+#[test]
 fn renamed_or_replaced_root_is_refused_and_never_reported_absent() {
     let base = scratch("win-moved");
     let nominal = base.join("Totum");

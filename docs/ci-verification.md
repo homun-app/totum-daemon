@@ -9,6 +9,8 @@ Stato al 27 novembre 2026. D3/P10 restano aperti; una suite compilata, avviata o
 | `473ab73`, [46010768568](https://github.com/homun-app/totum-daemon/actions/runs/46010768568) | 6 job verdi, 4 falliti | Registro reale Windows, verificatore systemd, TB-08 Linux con due account reali, self-test TB-08 su macOS/Linux e whitespace passati. Matrice Rust fermata da tipo umask non portabile e dipendenze mancanti per i metadati offline. Account Windows non creato per descrizione troppo lunga. |
 | `70e064c`, [46020171656](https://github.com/homun-app/totum-daemon/actions/runs/46020171656) | 8 job verdi, 2 falliti | Matrice Rust Linux e Windows passate; riconfermati tutti i sei job già verdi. macOS fallisce nella libreria per lock intermittente. Il job Windows dedicato verifica account, SID, token non elevato e scrittura, poi va in timeout nella suite `config`; fallisce anche la rimozione dell'albero. |
 
+| `22c7018`, [46025919180](https://github.com/homun-app/totum-daemon/actions/runs/46025919180) | 9 job verdi, 1 fallito | macOS e diagnostica passati. Il job Windows verifica il token e ora completa la pulizia; i log mostrano letture di `state.lock` rifiutate (errore 33), errore 5 alla sostituzione con lettore concorrente e mancato stop del lettore dopo il panico del writer. |
+
 Nel secondo run il rifiuto del daemon con token elevato è passato: uscita 1, diagnosi esplicita e nessuna radice creata. Il processo dell'account effimero ha riportato `tokenElevation=0`, `administratorRole=False` e `writeCheck=ok`. Le suite Windows successive a `config` non sono state raggiunte.
 
 ## Correzione locale dei test macOS
@@ -41,3 +43,9 @@ La verifica locale ha usato una distribuzione portabile ufficiale PowerShell in 
 Sono passati formato, Clippy con warning come errori, suite completa e build con lockfile e modalità offline su macOS, oltre a Clippy per `x86_64-pc-windows-gnu`. La compilazione incrociata non esegue i test Windows. Le due prove systemd che ritornano su macOS non costituiscono evidenza systemd locale; l'evidenza reale proviene dalla CI Linux.
 
 Restano aperti login reale, isolamento fra account su macOS e Windows, casi manuali del proprietario estraneo e durabilità alla perdita di alimentazione. Nessuna attivazione dell'avvio automatico, release o deployment è inclusa in queste correzioni.
+
+## Regressioni Windows dopo il terzo run
+
+Le snapshot dei test mantengono il nome di `state.lock` ma ne escludono il contenuto prima della lettura. Il file resta bloccato e i confronti dei file applicativi restano integrali. Il lettore concorrente riceve lo stop anche durante l’unwinding del writer. Entrambe le regressioni sono fallite prima della correzione e passate dopo su macOS. Lo stesso difetto di lettura del lock è stato corretto negli helper di lock e avvio.
+
+Una nuova prova Windows mantiene un lettore aperto per tutta la sostituzione e controlla vecchio handle, nuovo contenuto e scomparsa del temporaneo. Il backend usa ancora la sola `MoveFileExW`: questa prima esecuzione della prova serve a isolare il rifiuto prima di correggere la sostituzione. Nessun retry né aumento del timeout.

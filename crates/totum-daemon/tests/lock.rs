@@ -737,7 +737,7 @@ fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
         let entry = entry.expect("voce leggibile");
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path).expect("metadati disponibili");
-        let contents = if metadata.is_file() {
+        let contents = if metadata.is_file() && entry.file_name() != LOCK_FILE {
             fs::read(&path).expect("file leggibile")
         } else {
             Vec::new()

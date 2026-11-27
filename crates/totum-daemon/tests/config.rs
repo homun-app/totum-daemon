@@ -97,15 +97,16 @@ fn refused(decision: Decision) -> ConfigError {
     }
 }
 
-/// Nome e contenuto di ogni voce della radice, ordinati; le modalità POSIX
-/// sono controllate dalle prove specifiche di Unix.
+/// Nomi e contenuti ordinati; di state.lock si conserva soltanto il nome:
+/// il lock Windows impedisce la lettura anche attraverso un altro handle
+/// dello stesso processo. Il contenuto e il riuso sono provati dopo il rilascio.
 fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory).expect("directory leggibile") {
         let entry = entry.expect("voce leggibile");
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path).expect("metadati disponibili");
-        let contents = if metadata.is_file() {
+        let contents = if metadata.is_file() && entry.file_name() != platform::LOCK_FILE {
             fs::read(&path).expect("file leggibile")
         } else {
             Vec::new()
@@ -114,6 +115,58 @@ fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
     }
     entries.sort();
     entries
+}
+
+#[test]
+fn snapshot_keeps_the_lock_name_without_reading_its_contents() {
+    let scratch = Scratch::new("snapshot-lock");
+    let root = scratch.root();
+    let directory = root.path().to_path_buf();
+    write(&root, platform::LOCK_FILE, b"lock content is not state");
+    let locked = platform::lock(root).expect("lock acquisito");
+    assert_eq!(
+        snapshot(&directory),
+        vec![(platform::LOCK_FILE.to_owned(), Vec::new())]
+    );
+    drop(locked);
+    assert_eq!(
+        fs::read(directory.join(platform::LOCK_FILE)).unwrap(),
+        b"lock content is not state"
+    );
+}
+
+struct StopReader<'a>(&'a AtomicBool);
+
+impl Drop for StopReader<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn reader_is_stopped_when_the_writer_panics() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::time::{Duration, Instant};
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            stop.load(Ordering::Relaxed)
+        });
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _stop = StopReader(&stop);
+            panic!("guasto sintetico del writer");
+        }));
+        assert!(result.is_err());
+        assert!(
+            reader.join().expect("lettore terminato"),
+            "lettore non fermato durante unwinding"
+        );
+    });
 }
 
 #[cfg(unix)]
@@ -805,10 +858,12 @@ fn concurrent_readers_see_only_complete_generations() {
                 reads.fetch_add(1, Ordering::Relaxed);
             }
         });
+        // Questa guardia viene distrutta prima che scope attenda il lettore,
+        // anche se save fallisce e il writer termina con un panico.
+        let _stop = StopReader(stop);
         for _ in 0..SAVES {
             store.save().expect("salvataggio riuscito");
         }
-        stop.store(true, Ordering::Relaxed);
     });
 
     assert!(reads.load(Ordering::Relaxed) > 0, "il lettore ha letto");
