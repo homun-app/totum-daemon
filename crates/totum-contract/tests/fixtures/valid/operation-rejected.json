@@ -1,0 +1,12 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-operation-rejected",
+  "type": "operationRejected",
+  "operationId": "operation-2",
+  "error": {
+    "code": "targetUnavailable",
+    "retryable": true,
+    "detail": "runtime not reachable"
+  }
+}

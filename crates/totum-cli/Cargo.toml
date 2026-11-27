@@ -1,0 +1,10 @@
+[package]
+name = "totum-cli"
+version.workspace = true
+edition.workspace = true
+description = "Totum command-line interface scaffold (D1): version and status reporting only"
+publish = false
+
+[[bin]]
+name = "totum"
+path = "src/main.rs"

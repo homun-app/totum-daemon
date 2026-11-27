@@ -1,0 +1,7 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-pong",
+  "type": "pong",
+  "nonce": 42
+}

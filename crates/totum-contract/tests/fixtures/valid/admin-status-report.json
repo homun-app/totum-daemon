@@ -1,0 +1,12 @@
+{
+  "surface": "admin",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-admin-report",
+  "correlationId": "fixture-admin-request",
+  "type": "statusReport",
+  "hubVersion": "0.1.0",
+  "identity": {
+    "state": "present",
+    "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }
+}

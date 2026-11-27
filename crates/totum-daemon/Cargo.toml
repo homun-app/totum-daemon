@@ -1,0 +1,33 @@
+[package]
+name = "totum-daemon"
+version.workspace = true
+edition.workspace = true
+description = "Totum daemon: scaffold binaries plus the testable platform, config, identity and autostart modules (D3 P1-P9)"
+publish = false
+
+[lib]
+name = "totum_daemon"
+path = "src/lib.rs"
+
+# The platform and config modules are libraries only: no binary path uses them.
+# `serde`/`serde_json` are now normal dependencies for the versioned
+# configuration schema of D3 P3-P4 (AD-005), not only test dependencies.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }

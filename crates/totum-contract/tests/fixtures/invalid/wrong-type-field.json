@@ -1,0 +1,9 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-wrong-type",
+  "type": "sessionEvent",
+  "sessionId": "session-1",
+  "revision": "three",
+  "event": { "kind": "updated", "state": "working" }
+}

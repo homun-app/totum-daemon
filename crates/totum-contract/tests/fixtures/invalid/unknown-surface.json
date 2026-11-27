@@ -1,0 +1,6 @@
+{
+  "surface": "relay",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-unknown-surface",
+  "type": "getStatus"
+}

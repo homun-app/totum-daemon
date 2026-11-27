@@ -1,0 +1,24 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-hello-adapter",
+  "type": "adapterHello",
+  "adapterInstanceId": "adapter-1",
+  "productId": "example-product",
+  "technicalSurfaceId": "example-surface",
+  "adapterVersion": "0.3.0",
+  "supportedProtocol": {
+    "min": { "major": 1, "minor": 0 },
+    "max": { "major": 1, "minor": 0 }
+  },
+  "declaredCapabilities": [
+    "discoverSessions",
+    "readStatus",
+    "receiveApproval",
+    "decideApproval",
+    "receiveInput",
+    "reply",
+    "stop",
+    "futureCapability"
+  ]
+}

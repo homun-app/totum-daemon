@@ -1,0 +1,35 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-discovery-result",
+  "type": "discoveryResult",
+  "discoveryId": "discovery-1",
+  "runtimes": [
+    {
+      "runtimeId": "runtime-1",
+      "productId": "example-product",
+      "technicalSurfaceId": "example-surface",
+      "runtimeVersion": "1.4.2",
+      "state": "available"
+    }
+  ],
+  "projects": [
+    { "projectId": "project-alpha", "label": "Alpha" }
+  ],
+  "sessions": [
+    {
+      "sessionId": "session-1",
+      "projectId": "project-alpha",
+      "runtimeId": "runtime-1",
+      "mode": "managed",
+      "state": "approval",
+      "conversation": { "conversationId": "conversation-1" },
+      "execution": { "executionId": "execution-1" },
+      "declaredCapabilities": [
+        "readStatus",
+        "receiveApproval",
+        "decideApproval"
+      ]
+    }
+  ]
+}

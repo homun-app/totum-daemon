@@ -1,0 +1,12 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-hello-hub",
+  "type": "hubHello",
+  "selectedVersion": { "major": 1, "minor": 0 },
+  "hubSupported": {
+    "min": { "major": 1, "minor": 0 },
+    "max": { "major": 1, "minor": 0 }
+  },
+  "recognizedCapabilities": ["discoverSessions", "futureCapability"]
+}

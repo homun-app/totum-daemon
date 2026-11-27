@@ -1,0 +1,13 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-control-character",
+  "type": "operation",
+  "operationId": "operation-4",
+  "sessionId": "session-1",
+  "operation": {
+    "kind": "reply",
+    "requestId": "request-1",
+    "text": "line\u0001break"
+  }
+}

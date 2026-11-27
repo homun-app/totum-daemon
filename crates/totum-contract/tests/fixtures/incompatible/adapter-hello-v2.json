@@ -1,0 +1,15 @@
+{
+  "surface": "adapter",
+  "version": { "major": 2, "minor": 0 },
+  "id": "fixture-hello-v2",
+  "type": "adapterHello",
+  "adapterInstanceId": "adapter-1",
+  "productId": "example-product",
+  "technicalSurfaceId": "example-surface",
+  "adapterVersion": "0.4.0",
+  "supportedProtocol": {
+    "min": { "major": 2, "minor": 0 },
+    "max": { "major": 2, "minor": 3 }
+  },
+  "declaredCapabilities": ["readStatus"]
+}

@@ -1,0 +1,8 @@
+{
+  "surface": "admin",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-identity-report",
+  "correlationId": "fixture-identity-request",
+  "type": "hubIdentityReport",
+  "identity": { "state": "notInitialized" }
+}

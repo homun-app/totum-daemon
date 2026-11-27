@@ -1,0 +1,14 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-operation",
+  "type": "operation",
+  "operationId": "operation-1",
+  "sessionId": "session-1",
+  "expiresAtUnixMs": 1893456000000,
+  "operation": {
+    "kind": "approve",
+    "requestId": "request-1",
+    "requestRevision": 2
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-operation-result-unknown",
+  "type": "operationResult",
+  "operationId": "operation-3",
+  "outcome": {
+    "outcome": "outcomeUnknown",
+    "reason": "noAcknowledgement"
+  }
+}

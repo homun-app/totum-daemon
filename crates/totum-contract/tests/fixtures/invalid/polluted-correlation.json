@@ -1,0 +1,7 @@
+{
+  "surface": "admin",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-polluted-correlation",
+  "correlationId": "fixture-admin-request",
+  "type": "getStatus"
+}

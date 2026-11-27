@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  whitespace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check committed whitespace
+        run: git show --format= --check HEAD
+
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint with warnings as errors
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        if: runner.os != 'Windows'
+        run: cargo test --workspace --locked
+      - name: Test outside the state (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --locked --exclude totum-daemon
+      - name: Test daemon entry points without state (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test -p totum-daemon --locked
+          --test dependency_perimeter --test cli --test autostart
+          --test platform --test systemd_unit_verify --test tb08_harness
+      - name: Build
+        run: cargo build --workspace --locked
+
+  windows-non-elevated:
+    name: Windows prove di stato (utente non elevato)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Run the state tests with a verified standard-user token
+        run: >-
+          pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass
+          -File ./.github/scripts/windows-non-elevated.ps1
+          -Workspace "$env:GITHUB_WORKSPACE"
+
+  registry-windows:
+    name: registro Windows (chiavi di prova isolate)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Test the real registry backend on isolated keys
+        run: cargo test -p totum-daemon --lib --locked real_backend -- --nocapture
+
+  systemd-linux:
+    name: formato systemd (consumatore reale)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Verify the unit with systemd-analyze
+        env:
+          TOTUM_REQUIRE_SYSTEMD_ANALYZE: "1"
+        run: cargo test -p totum-daemon --test systemd_unit_verify --locked -- --nocapture
+
+  tb08-selftest:
+    name: TB-08 prove simulate (senza privilegi)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test dell'harness con comandi simulati
+        run: bash .github/scripts/tb08-linux.sh --self-test
+
+  tb08-linux:
+    name: TB-08 isolamento fra account (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Build the daemon
+        run: cargo build -p totum-daemon --bin totum-daemon --locked
+      - name: Due account effimeri su una radice di stato
+        run: >-
+          sudo env
+          TOTUM_TB08_CI=1
+          GITHUB_ACTIONS="${GITHUB_ACTIONS:-}"
+          CI="${CI:-}"
+          RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT:-}"
+          .github/scripts/tb08-linux.sh "$PWD/target/debug/totum-daemon"

@@ -1,0 +1,7 @@
+{
+  "surface": "adapter",
+  "version": { "major": 1, "minor": 0 },
+  "id": "fixture-shutdown",
+  "type": "shutdown",
+  "reason": "restarting"
+}
