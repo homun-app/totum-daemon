@@ -301,7 +301,28 @@ fn the_lock_follows_the_anchored_directory_not_the_nominal_path() {
     // La directory ancorata viene rinominata e un'altra ne occupa il percorso
     // nominale: l'identità della directory, non il testo del percorso, decide
     // quale radice è protetta.
-    fs::rename(&directory, &moved).expect("rinomina della radice");
+    let renamed = fs::rename(&directory, &moved);
+    #[cfg(windows)]
+    if let Err(error) = &renamed {
+        // Windows puo' impedire la rinomina di una cartella contenente il
+        // file bloccato. Provare il rifiuto e il lock conservato, poi ripetere
+        // dopo il rilascio: non accettare un errore generico di permessi.
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        assert!(directory.is_dir());
+        assert!(!moved.exists());
+        match platform::lock(scratch.root()) {
+            Err(error) => is_already_running(error, &directory.join(LOCK_FILE)),
+            Ok(_) => panic!("la rinomina rifiutata non deve liberare il lock"),
+        }
+        drop(held);
+        fs::rename(&directory, &moved).expect("rinomina riuscita dopo il rilascio");
+        let moved_root = platform::prepare_root(&moved).expect("radice spostata valida");
+        let acquired = platform::lock(moved_root).expect("lock riacquisibile dopo il rilascio");
+        assert_eq!(acquired.lock_path(), moved.join(LOCK_FILE));
+        eprintln!("Windows: rinomina rifiutata con lock vivo, riuscita dopo il rilascio");
+        return;
+    }
+    renamed.expect("rinomina della radice");
     fs::create_dir(&directory).expect("nuova directory sullo stesso percorso");
     #[cfg(unix)]
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))

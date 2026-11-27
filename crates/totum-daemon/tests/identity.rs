@@ -171,12 +171,18 @@ fn first_initialization_creates_both_documents_and_the_reopen_changes_nothing() 
     assert_eq!(startup.identity.grant_revision(), 0);
     assert_eq!(startup.identity.controller_count(), 0);
     assert_eq!(startup.discarded_temporaries, Vec::<OsString>::new());
+    #[cfg(not(windows))]
     assert!(
         startup
             .created
             .iter()
             .all(|created| created.commit().durable())
     );
+    #[cfg(windows)]
+    assert!(startup.created.iter().all(|created| matches!(
+        created.commit(),
+        identity::Commit::CommittedNotDurable { .. }
+    )));
     assert_eq!(read(&directory, IDENTITY_FILE), IDENTITY);
     assert_eq!(read(&directory, CONTROLLERS_FILE), CONTROLLERS);
     assert_eq!(entries(&directory), initial_entries());

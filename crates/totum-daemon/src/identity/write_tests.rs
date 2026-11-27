@@ -107,7 +107,13 @@ fn create_missing_publishes_the_exact_document_without_temporaries() {
 
     let created = write::create_missing(&root, IDENTITY_FILE, IDENTITY).expect("creato");
     assert_eq!(created.file_name(), IDENTITY_FILE);
+    #[cfg(not(windows))]
     assert!(created.commit().durable());
+    #[cfg(windows)]
+    assert!(matches!(
+        created.commit(),
+        write::Commit::CommittedNotDurable { .. }
+    ));
     assert_eq!(read(&directory, IDENTITY_FILE), IDENTITY);
     assert!(reserved_temporaries(&directory).is_empty());
     assert_eq!(entries(&directory), vec![IDENTITY_FILE.to_owned()]);

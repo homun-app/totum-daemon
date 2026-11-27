@@ -11,6 +11,8 @@ Stato al 27 novembre 2026. D3/P10 restano aperti; una suite compilata, avviata o
 
 | `22c7018`, [46025919180](https://github.com/homun-app/totum-daemon/actions/runs/46025919180) | 9 job verdi, 1 fallito | macOS e diagnostica passati. Il job Windows verifica il token e ora completa la pulizia; i log mostrano letture di `state.lock` rifiutate (errore 33), errore 5 alla sostituzione con lettore concorrente e mancato stop del lettore dopo il panico del writer. |
 
+| `97b5d9d`, [46031117777](https://github.com/homun-app/totum-daemon/actions/runs/46031117777) | 9 job verdi, 1 fallito | Tutte le sei suite Windows sono state eseguite senza timeout. Snapshot e stop corretti; regressione del lettore aperto e prova concorrente fallite con errore 5. Startup passata (11 prove). Falliscono anche due aspettative di durabilità su Windows e il caso di rinomina di directory contenente un lock vivo. Pulizia riuscita. |
+
 Nel secondo run il rifiuto del daemon con token elevato è passato: uscita 1, diagnosi esplicita e nessuna radice creata. Il processo dell'account effimero ha riportato `tokenElevation=0`, `administratorRole=False` e `writeCheck=ok`. Le suite Windows successive a `config` non sono state raggiunte.
 
 ## Correzione locale dei test macOS
@@ -48,4 +50,6 @@ Restano aperti login reale, isolamento fra account su macOS e Windows, casi manu
 
 Le snapshot dei test mantengono il nome di `state.lock` ma ne escludono il contenuto prima della lettura. Il file resta bloccato e i confronti dei file applicativi restano integrali. Il lettore concorrente riceve lo stop anche durante l’unwinding del writer. Entrambe le regressioni sono fallite prima della correzione e passate dopo su macOS. Lo stesso difetto di lettura del lock è stato corretto negli helper di lock e avvio.
 
-Una nuova prova Windows mantiene un lettore aperto per tutta la sostituzione e controlla vecchio handle, nuovo contenuto e scomparsa del temporaneo. Il backend usa ancora la sola `MoveFileExW`: questa prima esecuzione della prova serve a isolare il rifiuto prima di correggere la sostituzione. Nessun retry né aumento del timeout.
+Una nuova prova Windows mantiene un lettore aperto per tutta la sostituzione e controlla vecchio handle, nuovo contenuto e scomparsa del temporaneo. Nel commit `97b5d9d` il backend usava ancora la sola `MoveFileExW`: la prima esecuzione nativa della prova ha isolato e riprodotto il rifiuto. La successiva correzione usa `std::fs::rename` della toolchain fissata (AD-013), con percorso alternativo POSIX già implementato dalla libreria standard. Nessun retry né aumento del timeout.
+
+Le prove d’identità distinguono ora il commit Windows non durevole dalla durabilità Unix; la prova del lock verifica anche il caso Windows che impedisce la rinomina fino al rilascio. Il primo run ha raggiunto tutte le suite, con una sola prova fallita in ciascuna di `config`, `identity`, `lock`, `platform_windows` e libreria. Si richiede una nuova CI per confermare queste correzioni.

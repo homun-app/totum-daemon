@@ -429,8 +429,9 @@ impl VerifiedRoot {
 
     /// Sostituisce atomicamente `target` esistente con `temp`.
     ///
-    /// `MoveFileExW` con `MOVEFILE_REPLACE_EXISTING` sostituisce la voce di
-    /// directory; un lettore vede la generazione precedente o quella nuova. Fra
+    /// La libreria standard della toolchain fissata usa anche FileRenameInfoEx
+    /// con semantica POSIX se MoveFileExW rifiuta una destinazione aperta.
+    /// Un lettore vede la generazione precedente o quella nuova. Fra
     /// il ricontrollo del percorso e la chiamata resta la finestra residua
     /// dichiarata delle API basate su percorso.
     pub fn replace_file(&self, temp: &OsStr, target: &OsStr) -> Result<(), PlatformError> {
@@ -440,18 +441,8 @@ impl VerifiedRoot {
         let temp_path = self.path.join(temp);
         let target_path = self.path.join(target);
 
-        // SAFETY: i due percorsi sono stringhe UTF-16 terminate da NUL.
-        let moved = unsafe {
-            fs::MoveFileExW(
-                wide(&temp_path).as_ptr(),
-                wide(&target_path).as_ptr(),
-                fs::MOVEFILE_REPLACE_EXISTING,
-            )
-        };
-        if moved == 0 {
-            return Err(move_error(&temp_path, &target_path, last_error()));
-        }
-        Ok(())
+        std::fs::rename(&temp_path, &target_path)
+            .map_err(|error| move_error(&temp_path, &target_path, error))
     }
 
     /// Rimuove un file nella radice, senza seguirne eventuali reparse point.

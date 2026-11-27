@@ -409,3 +409,17 @@ Gli ACL estesi di macOS sono letti con dichiarazioni `extern "C"` verso libSyste
 ### Correzione dell’harness dopo la seconda CI
 
 La coordinazione fra spawn e transizioni dei lock è condivisa fra i test di configurazione e identità nel solo modulo `cfg(test)` `test_support`. Si corregge il perimetro del mutex senza introdurre retry né modifiche al lock operativo. L’attesa dei processi Windows conserva i log anche al timeout e stampa avanzamento e metadati dei soli processi interessati; prima di cancellare l’account effimero, la sorgente viene rimossa con il suo token per rispettare le DACL del proprietario. Il self-test non privilegiato prova cattura, uscita e pulizia sintetica; cambio di account e ACL reali richiedono il prossimo run Windows. La causa del timeout resta da accertare. [Evidenze e limiti](ci-verification.md).
+
+## AD-013 — Sostituzione Windows con lettori aperti
+
+**Data:** 27 novembre 2026. **Stato:** accettata come correzione di D3 P4, autorizzata dall’utente. **Ambito:** `platform::replace_file` e prove di stato Windows.
+
+**Evidenza.** La CI del commit `97b5d9d` ([run 46031117777](https://github.com/homun-app/totum-daemon/actions/runs/46031117777)) ha riprodotto errore 5 con un lettore tenuto aperto, anche se aperto con condivisione di eliminazione. È fallita anche la prova concorrente; grazie allo stop durante unwinding, la suite è terminata senza timeout. Le nuove regressioni di snapshot e stop sono passate su Windows.
+
+**Decisione.** Usare `std::fs::rename` della toolchain già fissata a Rust 1.95.0, senza nuove dipendenze o feature. L’implementazione Windows prova `MoveFileExW` e, su accesso negato, apre la sorgente senza seguire reparse point e usa `SetFileInformationByHandle(FileRenameInfoEx)` con `REPLACE_IF_EXISTS | POSIX_SEMANTICS`. Non imposta il flag che ignora il solo attributo di lettura. Il cambio di API è nella libreria standard: non viene introdotto un ciclo di retry né una cancellazione preventiva. Validazione dei nomi, verifica della radice, mappatura degli errori, DACL e pubblicazione senza sostituzione restano invariate.
+
+**Prove.** La regressione Windows mantiene un vecchio handle aperto durante la sostituzione: deve leggere la generazione precedente, mentre il nome pubblico deve aprire quella nuova e il temporaneo deve sparire. Si conserva anche la prova concorrente dei venti salvataggi. Le prove d’identità ora richiedono esplicitamente `CommittedNotDurable` su Windows e commit durevole su Unix, coerentemente con la sincronizzazione disponibile. Se Windows rifiuta la rinomina della directory con il lock vivo, la prova accetta soltanto gli errori 5/32, dimostra che il lock è ancora esclusivo e che la rinomina e la riacquisizione riescono dopo il rilascio; se la rinomina è consentita, resta il percorso della prova sull’ancoraggio. Nessun caso è ignorato.
+
+**Limiti.** L’esito nativo dopo la correzione richiede la nuova CI. Non si dichiara un nuovo requisito minimo di Windows né supporto per filesystem non provati. Se il sistema non consente la sostituzione, l’errore resta esplicito e il principale non viene rimosso. Durabilità Windows, login reale e isolamento fra account su Windows/macOS restano non dimostrati.
+
+**Fonti primarie:** [sorgente Rust 1.95.0, funzione rename](https://github.com/rust-lang/rust/blob/1.95.0/library/std/src/sys/fs/windows.rs#L1239), [Microsoft: FILE_RENAME_INFORMATION e semantica POSIX](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information).
