@@ -115,7 +115,7 @@ Le prove della libreria coprono:
 
 ## Limiti
 
-- Le prove sono eseguite su macOS e nella suite Linux della seconda CI. Su Windows compilano, ma il job non elevato è andato in timeout nella precedente suite `config`: identità, reparse point e riconoscimento Windows di `0xC0000409` restano privi di esecuzione verificata. La matrice Rust Windows esclude le prove di stato; vedere [le evidenze CI](ci-verification.md).
+- Le prove sono eseguite su macOS, Linux e Windows. Nel run 46033261562 le 13 prove d’integrazione Windows e le prove di identità incluse nella libreria sono passate con token non elevato, compresi gli arresti `0xC0000409`. Su Windows il commit resta esplicitamente non durevole per l’assenza di sincronizzazione della directory. [Evidenze CI](ci-verification.md).
 - ACL effettive, isolamento fra account e un `identity.json` posseduto da un altro account richiedono privilegi o un secondo account e non sono stati provati. Un file con proprietario errato è un rifiuto per costruzione, non una prova eseguita.
 - La durabilità alla perdita di alimentazione non è provata.
 - Il lock è consultivo e non copre processi che lo ignorano.
