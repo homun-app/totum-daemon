@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup show
+      - name: Fetch every locked dependency
+        run: cargo fetch --locked
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint with warnings as errors

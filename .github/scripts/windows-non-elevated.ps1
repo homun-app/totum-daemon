@@ -342,7 +342,7 @@ try {
     }
     $password = [Guid]::NewGuid().ToString('N') + '!Aa1'
     $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
-    $account = New-LocalUser -Name $name -Password $secure -PasswordNeverExpires -AccountNeverExpires -Description 'Totum CI ephemeral account for non-elevated tests'
+    $account = New-LocalUser -Name $name -Password $secure -PasswordNeverExpires -AccountNeverExpires -Description 'Totum CI ephemeral non-elevated account'
     $script:userName = $name
     $script:userSid = $account.SID.Value
     $users = Get-LocalGroup -SID 'S-1-5-32-545'

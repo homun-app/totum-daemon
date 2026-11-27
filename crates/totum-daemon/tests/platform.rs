@@ -65,8 +65,8 @@ struct Umask {
 }
 
 impl Umask {
-    fn set(mask: u16) -> Self {
-        let previous = rustix::process::umask(Mode::from_raw_mode(mask));
+    fn set(mask: Mode) -> Self {
+        let previous = rustix::process::umask(mask);
         Umask { previous }
     }
 }
@@ -100,7 +100,7 @@ fn creates_missing_components_with_forced_permissions() {
     let scratch = Scratch::new("umask-000");
     let nominal = scratch.path.join("a/b/totum");
 
-    let umask = Umask::set(0o000);
+    let umask = Umask::set(Mode::from_bits_retain(0o000));
     let root = prepare(&nominal).expect("radice preparabile con umask 000");
     let file = root
         .create_file(OsStr::new("config.json"))
@@ -127,7 +127,7 @@ fn permissive_umask_cannot_weaken_created_objects() {
     let scratch = Scratch::new("umask-777");
     let nominal = scratch.path.join("totum");
 
-    let umask = Umask::set(0o777);
+    let umask = Umask::set(Mode::from_bits_retain(0o777));
     let root = prepare(&nominal).expect("radice preparabile con umask 777");
     let file = root
         .create_file(OsStr::new("state"))
