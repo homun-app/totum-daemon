@@ -304,6 +304,8 @@ fn a_corrupt_main_is_refused_without_being_truncated() {
         .write_all(b"not a redb database at all, just bytes")
         .unwrap();
     file.sync_all().unwrap();
+    // Windows apre il file di creazione senza condivisione.
+    drop(file);
     let mut before = Vec::new();
     std::fs::File::open(&path)
         .unwrap()
