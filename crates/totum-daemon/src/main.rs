@@ -76,6 +76,13 @@ fn report(startup: &Startup) {
         }
     }
 
+    if let Some(from) = startup.journal_startup().migrated_from {
+        eprintln!(
+            "totum-daemon: migrazione del journal: schema {from} trasformato in {}; eventi conservati con la stessa sequenza",
+            journal::SCHEMA_VERSION
+        );
+    }
+
     match &startup.journal_startup().kind {
         journal::StartupKind::FirstRun { publication } => {
             eprintln!(

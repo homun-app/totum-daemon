@@ -5,9 +5,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use totum_daemon::config::{CoherenceInput, ComponentState, Store};
-use totum_daemon::journal::{Event, JOURNAL_FILE, Journal, JournalError, StartupKind};
+use totum_daemon::journal::{
+    Event, JOURNAL_FILE, Journal, JournalError, Position, RetentionLimits, RetentionOutcome,
+    StartupKind,
+};
 use totum_daemon::platform::{self, LockedRoot, PlatformError, SharedRoot};
 
 const COHERENT: CoherenceInput = CoherenceInput {
@@ -93,6 +97,50 @@ fn journal_temporaries(directory: &Path) -> Vec<String> {
         .into_iter()
         .filter(|name| name.starts_with(".journal.") && name.ends_with(".tmp"))
         .collect()
+}
+
+struct Reap(std::process::Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Avvia un test ignorato dello stesso binario come processo separato.
+///
+/// Il mutex delle fork è tenuto fino al ritorno di `spawn`, che attende
+/// `exec`: nessun avvio può cadere fra il rilascio e la riacquisizione del
+/// lock di un altro test.
+fn spawn_child(test: &str, dir: &Scratch) -> Reap {
+    let _forks = fork_window();
+    Reap(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", test])
+            .env("TOTUM_TEST_JOURNAL_ROOT", dir.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// Attende la barriera scritta dal figlio, senza attesa attiva sul lock.
+fn wait_ready(dir: &Scratch, child: &mut Reap) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "figlio terminato prima della barriera"
+        );
+        if std::fs::read(dir.0.join("ready")).is_ok_and(|bytes| bytes == b"ok") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timeout attendendo il commit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -349,44 +397,35 @@ fn journal_crash_child() {
 }
 
 #[test]
-fn acknowledged_batch_survives_process_termination() {
-    use std::process::{Child, Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    struct Reap(Child);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    let dir = Scratch::new();
-    let mut child = {
-        let _forks = fork_window();
-        Reap(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--ignored", "--exact", "journal_crash_child"])
-                .env("TOTUM_TEST_JOURNAL_ROOT", dir.root())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        )
+#[ignore = "eseguito soltanto dal test padre"]
+fn journal_retention_child() {
+    let Ok(root) = std::env::var("TOTUM_TEST_JOURNAL_ROOT") else {
+        return;
     };
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let root = Path::new(&root);
+    let locked = platform::lock(platform::prepare_root(root).unwrap()).unwrap();
+    let (mut journal, _) = Journal::open(locked).unwrap();
+    let outcome = journal
+        .retain(
+            RetentionLimits {
+                max_logical_bytes: 0,
+                max_age: Duration::MAX,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+    assert!(matches!(outcome, RetentionOutcome::Advanced { .. }));
+    std::fs::write(root.parent().unwrap().join("ready"), b"ok").unwrap();
     loop {
-        assert!(
-            child.0.try_wait().unwrap().is_none(),
-            "figlio terminato prima della barriera"
-        );
-        if std::fs::read(dir.0.join("ready")).is_ok_and(|bytes| bytes == b"ok") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timeout attendendo il commit");
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::park();
     }
+}
+
+#[test]
+fn acknowledged_batch_survives_process_termination() {
+    let dir = Scratch::new();
+    let mut child = spawn_child("journal_crash_child", &dir);
+    wait_ready(&dir, &mut child);
     child.0.kill().unwrap();
     assert!(!child.0.wait().unwrap().success());
     let (mut journal, startup) = Journal::open(dir.lock()).unwrap();
@@ -411,4 +450,97 @@ fn acknowledged_batch_survives_process_termination() {
         ]
     );
     assert_eq!(journal.append(&[b"three"]).unwrap(), 3..=3);
+}
+
+#[test]
+fn the_retention_floor_survives_process_termination() {
+    let dir = Scratch::new();
+    let (mut journal, _) = Journal::open(dir.lock()).unwrap();
+    let epoch = journal.epoch().unwrap();
+    journal.append(&[b"one", b"two", b"three"]).unwrap();
+    journal.snapshot().unwrap();
+    drop(journal);
+
+    let mut child = spawn_child("journal_retention_child", &dir);
+    wait_ready(&dir, &mut child);
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+
+    let (mut journal, startup) = Journal::open(dir.lock()).unwrap();
+    assert!(
+        matches!(startup.kind, StartupKind::Existing { repaired: true }),
+        "esito inatteso: {:?}",
+        startup.kind
+    );
+    assert_eq!(journal.epoch().unwrap(), epoch);
+    let stats = journal.statistics().unwrap();
+    assert_eq!((stats.floor, stats.high_water, stats.events), (3, 3, 0));
+    assert!(matches!(
+        journal.read_from(Position::new(epoch, 0), 1),
+        Err(JournalError::RetentionExpired { floor: 3, .. })
+    ));
+    assert_eq!(journal.append(&[b"four"]).unwrap(), 4..=4);
+}
+
+#[test]
+fn positions_epoch_and_floor_survive_reopen() {
+    let dir = Scratch::new();
+    let (mut journal, _) = Journal::open(dir.lock()).unwrap();
+    let epoch = journal.epoch().unwrap();
+    journal.append(&[b"a", b"b", b"c"]).unwrap();
+    journal.snapshot().unwrap();
+    let outcome = journal
+        .retain(
+            RetentionLimits {
+                max_logical_bytes: 2,
+                max_age: Duration::MAX,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        RetentionOutcome::Advanced {
+            from_floor: 0,
+            to_floor: 1,
+            ..
+        }
+    ));
+    let (mut journal, _) = {
+        let _forks = fork_window();
+        drop(journal);
+        Journal::open(dir.lock()).unwrap()
+    };
+    assert_eq!(journal.epoch().unwrap(), epoch);
+    assert_eq!(journal.statistics().unwrap().floor, 1);
+    assert!(matches!(
+        journal.read_from(Position::new(epoch, 0), 1),
+        Err(JournalError::RetentionExpired { floor: 1, .. })
+    ));
+    assert_eq!(journal.append(&[b"d"]).unwrap(), 4..=4);
+
+    let next = journal.reset().unwrap();
+    assert_ne!(next, epoch);
+    assert!(matches!(
+        journal.read_from(Position::new(epoch, 3), 1),
+        Err(JournalError::EpochChanged { expected, found })
+            if expected == next && found == epoch
+    ));
+    assert_eq!(journal.append(&[b"fresh"]).unwrap(), 1..=1);
+    let (journal, _) = {
+        let _forks = fork_window();
+        drop(journal);
+        Journal::open(dir.lock()).unwrap()
+    };
+    assert_eq!(journal.epoch().unwrap(), next);
+    assert_eq!(
+        journal
+            .read_from(Position::new(next, 0), 16)
+            .unwrap()
+            .events,
+        [Event {
+            sequence: 1,
+            payload: b"fresh".to_vec()
+        }]
+    );
 }

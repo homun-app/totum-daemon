@@ -439,8 +439,7 @@ della pubblicazione iniziale del file richiede ancora un contratto e prove
 specifiche. Un errore ritornato dal commit è classificato come esito
 sconosciuto e richiede riapertura, senza ritentare automaticamente.
 
-Restano da integrare epoch, snapshot e retention. L'API del modulo è una base
-interna per questi passi.
+Restano da integrare epoch, snapshot e retention, aggiunti nel passo successivo descritto sotto. L'API del modulo è una base interna per questi passi.
 
 ### Integrazione con l'avvio e bootstrap recuperabile
 
@@ -472,7 +471,8 @@ recuperare): elenco e rimozione dei soli residui del namespace riservato
 `.journal.<pid>.<contatore>.tmp`; creazione del temporaneo con le primitive di
 `platform` (0600, nessun collegamento, ACL verificate); apertura redb senza
 controllo di integrità; transazione con `schema=1`, `last=0` e la tabella
-`events`; commit; chiusura del database; pubblicazione del temporaneo con
+`events` (nel primo passo; dal passo successivo il bootstrap scrive
+`schema=2` con epoch, floor, tempi e snapshot, come descritto sotto); commit; chiusura del database; pubblicazione del temporaneo con
 `publish_file`, che non sostituisce mai un oggetto esistente; conservazione del
 nome; sincronizzazione della directory; riapertura del principale e validazione
 dei metadati Totum. Il commit dello schema avviene sul temporaneo, quindi un
@@ -558,3 +558,93 @@ errore del motore durante la lettura, non all'apertura. La durabilità alla
 perdita di alimentazione non è provata; su Windows la conferma della voce di
 directory non è disponibile. Isolamento fra account, login reale e crash del
 sistema restano aperti.
+
+### Epoch, posizioni, snapshot e retention
+
+**Data:** 28 novembre 2026. **Stato:** accettata come passo D4 successivo,
+autorizzata dall'utente. **Ambito:** `journal`, `journal::snapshot`,
+`journal::retention` e il report del binario.
+
+**Schema 2 e migrazione in avanti.** Il bootstrap scrive in un'unica transazione
+`schemaVersion = 2`, epoch iniziale, floor a zero, posizione vuota, tempo di
+ingestione e le tabelle `events`, `times` e `snapshots`. La classificazione in
+sola lettura distingue schema corrente, schema 1 migrabile, schema futuro e
+corruzione; uno schema 2 privo di epoch o floor è corrotto. Lo schema 1 scritto
+dalla baseline viene migrato in un'unica transazione: gli eventi e le loro
+sequenze non vengono riscritti, viene introdotta l'epoch, il floor a zero, un
+tempo di ingestione per ogni evento già conservato e la tabella degli snapshot.
+Se il numero di eventi non coincide con la posizione dichiarata o le sequenze
+non sono contigue da 1, la migrazione è impossibile e il file viene rifiutato
+senza scritture, con byte identici. Non esistono downgrade né migrazioni
+applicate da `append`, snapshot o retention.
+
+**Posizioni ed epoch.** La posizione interna è la coppia `(epoch, seq)`.
+`seq = 0` è la posizione vuota iniziale; il primo batch assegna da 1 e una
+sequenza rimossa non viene mai riutilizzata. `read_from` legge epoch, floor,
+high-water ed eventi nella stessa transazione e restituisce una pagina coerente
+con quei valori. Una posizione di un'altra epoch produce `EpochChanged`, una
+sotto il floor `RetentionExpired`, una oltre l'ultimo evento
+`PositionBeyondEnd`: non esistono salti o letture parziali silenziose. L'epoch
+non cambia a riapertura, recupero, snapshot o retention; soltanto `reset`, che
+non è esposto dal binario e non ha una pianificazione, ne crea una nuova,
+azzerando eventi, tempi e snapshot nella stessa transazione. `reset` verifica
+l'overflow prima di mutare e un errore di commit resta un esito sconosciuto che
+richiede la riapertura. L'epoch è un identificatore opaco generato da orologio,
+processo e contatore: non è un'identità crittografica.
+
+**Snapshot.** Il reducer è sintetico e deterministico (conteggio e checksum dei
+payload) e tiene uno stato cumulativo dall'inizio dell'epoch; non è il registro
+delle sessioni di prodotto. Uno snapshot dichiara epoch, schema del blob e
+ultima sequenza effettivamente applicata, riprende lo snapshot più recente della
+stessa epoch e applica soltanto il suffisso in un'unica transazione. Sono
+conservati al massimo due snapshot, i più recenti. Uno snapshot con un prefisso
+già rimosso e nessuno snapshot precedente è un rifiuto, non uno stato parziale.
+La verifica carica lo snapshot, applica gli eventi successivi e confronta il
+risultato con il replay completo del prefisso.
+
+**Retention.** `RetentionLimits` contiene le soglie di prova per byte logici ed
+età; l'orologio è un parametro esplicito del chiamante. La retention calcola il
+minimo prefisso che soddisfa entrambe le soglie e lo elimina soltanto se uno
+snapshot valido lo copre; eventi, tempi, snapshot superati e floor vengono
+aggiornati nella stessa transazione. Senza copertura l'esito è
+`RetentionOutcome::Blocked` con `required_floor` e `snapshot_through`, senza alcuna
+cancellazione; il floor non avanza mai oltre la copertura. Un cursore sotto il
+floor riceve `RetentionExpired`, non una pagina vuota. L'età usa il tempo di
+ingestione Totum; un orologio indietro o un tempo futuro non anticipa
+cancellazioni. I byte logici sono la somma dei payload conservati e non la
+dimensione fisica di `journal.redb`: non è promessa una riduzione immediata del
+file e non esiste una pianificazione automatica della retention. La dimensione
+fisica è letta dall'handle verificato e aperto dal backend, mai dal percorso
+nominale, quindi una rinomina o una sostituzione del nome non cambia il file
+misurato. La misura è diagnostica: se è indisponibile dopo il commit l'esito
+riporta comunque l'avanzamento già applicato, con `physical_bytes` a `None`, e
+non restituisce un errore che nasconderebbe un floor già avanzato. Il budget
+fisico e il blocco delle nuove scritture previsti dal piano D4 restano da
+completare.
+
+**Crash e commit.** Esistono punti d'arresto deterministici, attivi solo nelle
+prove, prima e dopo il commit di snapshot, retention e reset. Un arresto prima
+del commit non lascia la mutazione; uno dopo il commit riapre uno stato coerente
+e, se redb richiede il proprio ripristino, l'apertura lo segnala come già per
+il batch. Un errore di commit continua a essere `CommitOutcomeUnknown`, con
+riapertura necessaria e nessun ritentativo automatico.
+
+**Prove.** Il modulo `journal::tests` copre epoch stabile a riapertura,
+recupero, snapshot e retention; reset come unica origine di una nuova epoch;
+rifiuto delle posizioni di un'altra epoch, sotto il floor e oltre l'ultimo
+evento; overflow di sequenza ed epoch senza mutazioni; migrazione di un journal
+schema 1 con eventi conservati e rifiuto con byte identici di una sorgente non
+migrabile; reducer deterministico e sensibile all'ordine; snapshot più suffisso
+uguale al replay completo; due generazioni al massimo; soglie per byte e per età
+esatte, con orologio avanti e indietro; retention bloccata senza copertura;
+floor e prefisso rimossi insieme; distinzione fra byte logici e dimensione
+fisica, misurata sull'handle aperto anche quando il percorso nominale non
+identifica più il file, e un errore di misura che non nasconde un commit
+riuscito; pagine stabili rispetto agli append successivi; arresti reali di
+processi figli prima e dopo il commit di snapshot, retention e reset. Nel
+repository delle prove, `tests/journal.rs` verifica inoltre la sopravvivenza di
+epoch, posizioni e floor alla riapertura e l'avanzamento del floor dopo una
+terminazione non ordinata del processo. Le prove sintetiche non dimostrano una
+riduzione fisica del file, la durabilità alla perdita di alimentazione né
+l'isolamento fra account; il target Windows e le suite di stato restano da
+rieseguire sui runner nativi.
