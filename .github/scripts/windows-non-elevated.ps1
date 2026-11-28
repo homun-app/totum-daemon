@@ -328,6 +328,7 @@ try {
         '--test', 'identity',
         '--test', 'lock',
         '--test', 'platform_windows',
+        '--test', 'd4_windows_sqlite',
         '--test', 'startup',
         '--no-run', '--locked', '--message-format=json'
     ) -WorkingDirectory $source -TimeoutSeconds 900
@@ -336,7 +337,7 @@ try {
         throw 'compilazione delle prove fallita'
     }
 
-    $wanted = @('totum_daemon', 'config', 'identity', 'lock', 'platform_windows', 'startup')
+    $wanted = @('totum_daemon', 'config', 'identity', 'lock', 'platform_windows', 'd4_windows_sqlite', 'startup')
     $testArtifacts = @{}
     foreach ($line in Get-Content -LiteralPath $compile.StdOut) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -457,7 +458,7 @@ try {
 
     Write-Phase 'Prove di stato con token non elevato'
     $failures = [System.Collections.Generic.List[string]]::new()
-    foreach ($suite in @('config', 'identity', 'lock', 'platform_windows', 'startup', 'totum_daemon')) {
+    foreach ($suite in @('config', 'identity', 'lock', 'platform_windows', 'd4_windows_sqlite', 'startup', 'totum_daemon')) {
         Write-Phase "Esecuzione $suite"
         $result = Invoke-AsUser -Label "test-$suite" -FilePath $testArtifacts[$suite] -Arguments @('--skip', 'real_backend', '--nocapture', '--format', 'pretty', '--color', 'never') -TimeoutSeconds $StepTimeoutSeconds
         Show-Output -Result $result
