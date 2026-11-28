@@ -115,11 +115,17 @@ fn diagnostic_child() {
     }
     let db = Db::open(root);
     assert_eq!(db.exec("PRAGMA journal_mode=DELETE"), [["delete"]]);
-    db.exec("PRAGMA synchronous=EXTRA; PRAGMA cache_size=4; CREATE TABLE events(id INTEGER PRIMARY KEY, payload TEXT NOT NULL); INSERT INTO events VALUES(0,'seed'); BEGIN IMMEDIATE; WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<8) INSERT INTO events SELECT i,printf('batch-%d',i) FROM n;");
+    db.exec("PRAGMA synchronous=EXTRA; PRAGMA cache_size=4; CREATE TABLE events(id INTEGER PRIMARY KEY, payload TEXT NOT NULL); INSERT INTO events VALUES(0,'seed'); BEGIN IMMEDIATE; WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<8) INSERT INTO events SELECT i,printf('batch-%d-',i)||replace(hex(zeroblob(4096)),'0','x') FROM n;");
     if mode == "after" {
         db.exec("COMMIT");
     } else {
-        assert!(root.join("spike.db-journal").is_file());
+        let journal = fs::read(root.join("spike.db-journal")).unwrap();
+        assert!(journal.len() > 512, "journal non inizializzato");
+        assert_eq!(
+            &journal[..8],
+            &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
+            "journal non sincronizzato prima della barriera"
+        );
     }
     let mut ready = fs::File::create(root.parent().unwrap().join("ready")).unwrap();
     ready.write_all(b"ready").unwrap();
@@ -201,12 +207,15 @@ fn windows_native_sqlite_process_recovery_and_totum_lock() {
         assert_eq!(db.exec("PRAGMA integrity_check"), [["ok"]]);
         let mut expected = vec![vec!["0".to_owned(), "seed".to_owned()]];
         if mode == "after" {
-            expected.extend((1..=8).map(|id| vec![id.to_string(), format!("batch-{id}")]));
+            expected.extend(
+                (1..=8).map(|id| vec![id.to_string(), format!("batch-{id}-{}", "x".repeat(8192))]),
+            );
         }
         assert_eq!(
             db.exec("SELECT id,payload FROM events ORDER BY id"),
             expected
         );
+        drop(db);
         assert!(!root.join("spike.db-journal").exists());
         println!(
             "{mode}: lock escluso durante la connessione, riacquisito dopo arresto, {} record integri",
