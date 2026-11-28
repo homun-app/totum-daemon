@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use totum_daemon::config::{BackupState, Commit as ConfigCommit, GenerationFailure, StartupKind};
 use totum_daemon::identity::Commit as IdentityCommit;
+use totum_daemon::journal::{self, Publication};
 use totum_daemon::platform;
 use totum_daemon::startup::{self, Startup};
 
@@ -32,8 +33,9 @@ fn run_daemon() -> ExitCode {
                 env!("CARGO_PKG_VERSION"),
                 startup.root().display()
             );
-            // Lo Store trattiene radice e lock per tutta la vita del processo.
-            let _store = startup.into_store();
+            // Lo Startup trattiene store, journal, radice e lock per tutta la
+            // vita del processo.
+            let _startup = startup;
             wait_resident()
         }
         Err(message) => {
@@ -71,6 +73,37 @@ fn report(startup: &Startup) {
                 "totum-daemon: {} pubblicato con commit effettuato ma durabilità non confermata: {detail}; non è un errore e non viene ritentato",
                 created.file_name()
             );
+        }
+    }
+
+    match &startup.journal_startup().kind {
+        journal::StartupKind::FirstRun { publication } => {
+            eprintln!(
+                "totum-daemon: prima esecuzione: {} creato",
+                journal::JOURNAL_FILE
+            );
+            report_publication(publication);
+        }
+        journal::StartupKind::InterruptedBootstrap { publication } => {
+            eprintln!(
+                "totum-daemon: bootstrap del journal interrotto: {} temporanei scartati, {} creato",
+                startup.journal_startup().discarded_temporaries.len(),
+                journal::JOURNAL_FILE
+            );
+            report_publication(publication);
+        }
+        journal::StartupKind::Existing { repaired } => {
+            if *repaired {
+                eprintln!(
+                    "totum-daemon: journal riaperto dopo un ripristino del motore: stato interno redb ricostruito, dati Totum non reinterpretati"
+                );
+            }
+            if !startup.journal_startup().discarded_temporaries.is_empty() {
+                eprintln!(
+                    "totum-daemon: {} temporanei residui del journal scartati",
+                    startup.journal_startup().discarded_temporaries.len()
+                );
+            }
         }
     }
 
@@ -118,6 +151,15 @@ fn report(startup: &Startup) {
             report_preserved(preserved.as_ref());
             report_config_commit(commit);
         }
+    }
+}
+
+fn report_publication(publication: &Publication) {
+    if let Publication::NotDurable { detail } = publication {
+        eprintln!(
+            "totum-daemon: {} pubblicato con commit effettuato ma durabilità della voce di directory non confermata: {detail}; non è un errore e non viene ritentato",
+            journal::JOURNAL_FILE
+        );
     }
 }
 

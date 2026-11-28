@@ -326,6 +326,7 @@ try {
         '--lib',
         '--test', 'config',
         '--test', 'identity',
+        '--test', 'journal',
         '--test', 'lock',
         '--test', 'platform_windows',
         '--test', 'startup',
@@ -336,7 +337,7 @@ try {
         throw 'compilazione delle prove fallita'
     }
 
-    $wanted = @('totum_daemon', 'config', 'identity', 'lock', 'platform_windows', 'startup')
+    $wanted = @('totum_daemon', 'config', 'identity', 'journal', 'lock', 'platform_windows', 'startup')
     $testArtifacts = @{}
     foreach ($line in Get-Content -LiteralPath $compile.StdOut) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -457,7 +458,7 @@ try {
 
     Write-Phase 'Prove di stato con token non elevato'
     $failures = [System.Collections.Generic.List[string]]::new()
-    foreach ($suite in @('config', 'identity', 'lock', 'platform_windows', 'startup', 'totum_daemon')) {
+    foreach ($suite in @('config', 'identity', 'journal', 'lock', 'platform_windows', 'startup', 'totum_daemon')) {
         Write-Phase "Esecuzione $suite"
         $result = Invoke-AsUser -Label "test-$suite" -FilePath $testArtifacts[$suite] -Arguments @('--skip', 'real_backend', '--nocapture', '--format', 'pretty', '--color', 'never') -TimeoutSeconds $StepTimeoutSeconds
         Show-Output -Result $result

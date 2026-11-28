@@ -423,3 +423,138 @@ La coordinazione fra spawn e transizioni dei lock è condivisa fra i test di con
 **Limiti.** L’esito nativo Windows è confermato nel run 46033261562: sei suite passate, inclusa la regressione con lettore aperto; l’esito aggregato resta distinto dal successo di questo job. Non si dichiara un nuovo requisito minimo di Windows né supporto per filesystem non provati. Se il sistema non consente la sostituzione, l’errore resta esplicito e il principale non viene rimosso. Durabilità Windows, login reale e isolamento fra account su Windows/macOS restano non dimostrati.
 
 **Fonti primarie:** [sorgente Rust 1.95.0, funzione rename](https://github.com/rust-lang/rust/blob/1.95.0/library/std/src/sys/fs/windows.rs#L1239), [Microsoft: FILE_RENAME_INFORMATION e semantica POSIX](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information).
+
+## AD-014 — Primo modulo journal con redb
+
+Il proprietario ha scelto redb per D4 il 28 novembre 2026. Il daemon ammette
+`redb =5.0.0` dal registro pubblico, con le feature predefinite e il grafo
+bloccato in Cargo.lock. redb gestisce le transazioni e il formato fisico.
+Totum gestisce lo schema, i limiti e l'accesso al file. Il backend riceve
+un file verificato da platform e possiede il LockedRoot fino alla chiusura.
+Il grafo risolto aggiunge redb e riusa libc già presente.
+
+Questo primo modulo offre append atomico a batch e lettura paginata per
+sequenza. Il risultato di append conferma il commit redb. La durabilità
+della pubblicazione iniziale del file richiede ancora un contratto e prove
+specifiche. Un errore ritornato dal commit è classificato come esito
+sconosciuto e richiede riapertura, senza ritentare automaticamente.
+
+Restano da integrare epoch, snapshot e retention. L'API del modulo è una base
+interna per questi passi.
+
+### Integrazione con l'avvio e bootstrap recuperabile
+
+**Data:** 28 novembre 2026. **Stato:** accettata come passo D4 successivo,
+autorizzata dall'utente. **Ambito:** `platform::SharedRoot`, `journal`,
+`config::Store::open_shared`, `startup` e il binario `totum-daemon`.
+
+**Un solo lock, un solo consumatore per componente.** `LockedRoot::share`
+produce `SharedRoot`, un `Arc<LockedRoot>` che trattiene insieme la directory
+ancorata, il lock esclusivo e un registro interno degli occupanti.
+`startup::open` consuma l'unico `&mut LockedRoot` per l'inizializzazione
+dell'identità, poi lo converte in `SharedRoot` e lo cede per clonazione sia a
+`Store::open_shared` sia a `Journal::open`: configurazione e journal hanno
+accessi distinti alla stessa radice bloccata e il lock resta acquisito finché
+l'ultimo `SharedRoot` è vivo. Il registro ha due slot, `Config` e `Journal`:
+la seconda apertura dello stesso componente sulla stessa radice è
+`ConfigError::AlreadyOpen` o `JournalError::AlreadyOpen` e avviene prima di
+qualunque lettura o scrittura dei file, perché due istanze avrebbero mutex
+indipendenti e non serializzerebbero le rispettive scritture. Lo slot viene
+rilasciato dal `Drop` dell'occupazione (`RootClaim`), quindi una nuova apertura
+riesce soltanto dopo la chiusura della precedente. Configurazione e journal
+continuano a coesistere, ognuno nel proprio slot. Il backend del journal
+trattiene il proprio `SharedRoot` per l'intera vita del database.
+Il registro è per processo: fra processi resta decisivo il lock di
+`state.lock`, provato con un secondo processo reale.
+
+**Ordine del bootstrap** (`journal.redb` assente e nessun principale da
+recuperare): elenco e rimozione dei soli residui del namespace riservato
+`.journal.<pid>.<contatore>.tmp`; creazione del temporaneo con le primitive di
+`platform` (0600, nessun collegamento, ACL verificate); apertura redb senza
+controllo di integrità; transazione con `schema=1`, `last=0` e la tabella
+`events`; commit; chiusura del database; pubblicazione del temporaneo con
+`publish_file`, che non sostituisce mai un oggetto esistente; conservazione del
+nome; sincronizzazione della directory; riapertura del principale e validazione
+dei metadati Totum. Il commit dello schema avviene sul temporaneo, quindi un
+principale pubblicato è già valido e non esiste una finestra in cui
+`journal.redb` è vuoto o parziale.
+
+**Classificazione, schema futuro e corruzione.** Principale assente con
+residui: bootstrap interrotto, i residui vengono scartati e il journal viene
+ricreato (il commit del temporaneo non viene adottato). Principale assente senza
+residui: prima esecuzione. Principale presente: la classificazione apre il
+motore **in sola lettura**, che non ripara e non scrive; schema Totum successivo
+a 1 produce `FutureSchema`, metadati mancanti o incoerenti e corruzione esterna
+producono `Corrupt`. In entrambi i casi il file resta **identico byte per
+byte** e la prova lo verifica confrontando i byte prima e dopo due tentativi. Un
+principale vuoto è `Corrupt`: non autorizza alcun azzeramento. Un errore di
+commit redb resta un esito sconosciuto e non viene ritentato. La rimozione dei
+residui avviene soltanto con la radice bloccata e la pubblicazione non
+sovrascrive mai un nome esistente: se `journal.redb` compare durante il bootstrap
+l'esito è `AppearedDuringBootstrap`.
+
+**Journal che richiede recovery.** Se l'ultimo commit non è leggibile senza che
+redb ricostruisca il proprio stato, l'apertura in sola lettura restituisce
+`RepairAborted` e il caso è distinto da schema futuro e corruzione. L'apertura
+in scrittura esegue allora il ripristino di redb, poi la stessa convalida Totum
+decide; `StartupKind::Existing { repaired: true }` e il binario riportano che
+lo stato interno del motore è stato ricostruito. È l'unica mutazione prima della
+convalida Totum e tocca soltanto struttura e allocatore redb: schema, posizione
+ed eventi non vengono reinterpretati né riscritti. Se dopo il ripristino la
+convalida Totum rifiuta lo schema o i metadati, il rifiuto segue quella
+mutazione: è l'unico caso in cui un rifiuto non lascia il file byte-identico, e
+riguarda un file che non era leggibile senza ripristino. Un journal chiuso in modo
+ordinato non richiede ripristino; dopo una terminazione non ordinata il
+ripristino è atteso e provato con un figlio reale che scrive un batch e si
+interrompe senza chiudere.
+
+**Durabilità.** Un commit confermato da redb è irreversibile una volta iniziato
+il commit durevole. La pubblicazione è `Durable` solo se `platform` sincronizza
+la voce di directory (`DirectorySync::Synced`). Su Windows `sync_directory`
+restituisce `Unsupported`: la pubblicazione è `NotDurable`, il commit resta
+avvenuto e l'esito non viene ritentato. Il binario riporta la distinzione senza
+confonderla con un errore.
+
+**Crash verificati.** Prima della creazione del temporaneo: nessun file oltre
+`state.lock` e la riapertura è una prima esecuzione. Dopo la creazione e prima
+del commit: un temporaneo nel namespace riservato, scartato alla riapertura.
+Dopo il commit e prima della pubblicazione: temporaneo valido con schema, mai
+adottato, scartato alla riapertura. Dopo la pubblicazione e prima della
+sincronizzazione della directory: principale presente, riaperto come esistente;
+la durabilità della voce resta quella dichiarata dalla piattaforma.
+
+**Prove.** Modulo `journal::tests` con punti d'arresto deterministici attivi
+solo in `cfg(test)` e un figlio reale interrotto per ciascuno; schema futuro
+rifiutato due volte con byte identici; principale corrotto e vuoto rifiutati,
+con byte identici nel caso corrotto; journal non chiuso riaperto con ripristino
+segnalato e dati Totum intatti; residui fuori dal namespace non toccati;
+collegamento fisico rifiutato. Nel repository delle prove, `tests/journal.rs`
+verifica prima esecuzione e riavvio, residuo scartato, corruzione e schema
+futuro senza sostituzione, la seconda apertura rifiutata prima di toccare il
+file e una nuova apertura riuscita dopo la chiusura della prima con gli eventi
+intatti, e un secondo processo che resta respinto finché uno dei due
+utilizzatori (configurazione o journal) è vivo e riesce dopo l'ultima chiusura.
+`tests/lock.rs` verifica che un secondo `Store` sulla stessa radice sia
+rifiutato senza leggere i file, con byte e inode invariati, e che la riapertura
+dopo la chiusura riesca. `tests/startup.rs` verifica il nuovo file di stato, il
+riavvio senza inizializzazione, il report del bootstrap interrotto e l'inode del
+journal stabile fra le riaperture.
+
+**Mutazioni effettive.** Un `journal.redb` rifiutato per schema futuro o
+corruzione non viene scritto: la classificazione usa redb in sola lettura e la
+prova confronta i byte prima e dopo. Un journal accettato resta soggetto alla
+manutenzione interna di redb: la chiusura registra lo stato dell'allocatore e
+l'intestazione di arresto, quindi i byte possono cambiare fra un'apertura e
+l'altra senza che schema, posizione ed eventi cambino. Un journal che richiede
+ripristino viene ricostruito all'apertura con la mutazione segnalata. Nessuna
+di queste mutazioni riscrive i dati Totum.
+
+**Limiti.** Le prove sono eseguite su macOS; la compilazione Windows viene
+verificata dal job `windows-non-elevated`, che esegue anche la suite `journal`
+su un account non amministratore. Non viene eseguito un controllo d'integrità
+globale a ogni apertura, perché riscriverebbe il file: una corruzione di pagina
+non rilevata dalla lettura dell'intestazione e dell'allocatore emerge come
+errore del motore durante la lettura, non all'apertura. La durabilità alla
+perdita di alimentazione non è provata; su Windows la conferma della voce di
+directory non è disponibile. Isolamento fra account, login reale e crash del
+sistema restano aperti.

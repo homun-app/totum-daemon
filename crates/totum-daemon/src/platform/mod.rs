@@ -24,6 +24,7 @@ pub use error::PlatformError;
 use std::ffi::OsStr;
 use std::fs::{File, TryLockError};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 #[cfg(unix)]
 mod unix;
@@ -272,6 +273,62 @@ pub struct LockedRoot {
     // Vive insieme alla radice che ha prodotto l'acquisizione.
     _file: File,
     lock_path: PathBuf,
+    consumers: Mutex<Consumers>,
+}
+
+/// Componente che trattiene un accesso esclusivo alla radice.
+///
+/// Configurazione e journal possono coesistere perché occupano due slot
+/// distinti; due istanze dello stesso componente no, perché ognuna avrebbe la
+/// propria serializzazione interna e non vedrebbe le scritture dell'altra.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Consumer {
+    Config,
+    Journal,
+}
+
+#[derive(Debug, Default)]
+struct Consumers {
+    config: bool,
+    journal: bool,
+}
+
+impl Consumers {
+    fn slot(&mut self, consumer: Consumer) -> &mut bool {
+        match consumer {
+            Consumer::Config => &mut self.config,
+            Consumer::Journal => &mut self.journal,
+        }
+    }
+}
+
+/// Occupazione di uno slot della radice, rilasciata al `Drop`.
+///
+/// Trattiene un clone di [`SharedRoot`], quindi il lock resta acquisito finché
+/// l'occupante vive, anche se chi l'ha aperto non conserva altri accessi.
+#[derive(Debug)]
+pub(crate) struct RootClaim {
+    root: SharedRoot,
+    consumer: Consumer,
+}
+
+impl RootClaim {
+    /// Radice ancorata mentre l'occupazione è valida.
+    pub(crate) fn verified_root(&self) -> &VerifiedRoot {
+        self.root.verified_root()
+    }
+}
+
+impl Drop for RootClaim {
+    fn drop(&mut self) {
+        let mut consumers = self
+            .root
+            .0
+            .consumers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *consumers.slot(self.consumer) = false;
+    }
 }
 
 impl LockedRoot {
@@ -287,6 +344,75 @@ impl LockedRoot {
 
     pub(crate) fn verified_root(&self) -> &VerifiedRoot {
         &self.root
+    }
+
+    /// Trasforma l'oggetto unico in un accesso condivisibile.
+    ///
+    /// Consuma [`LockedRoot`]: da questo punto il lock è trattenuto da
+    /// [`SharedRoot`] e resta acquisito finché esiste almeno un accesso. Dopo
+    /// questa chiamata non è più possibile ottenere il riferimento esclusivo
+    /// richiesto da [`crate::identity::initialize`](crate::identity), quindi
+    /// l'inizializzazione dell'identità resta esclusiva per costruzione.
+    pub fn share(self) -> SharedRoot {
+        SharedRoot(Arc::new(self))
+    }
+}
+
+/// Accesso condiviso alla radice bloccata, con il lock trattenuto.
+///
+/// Si ottiene soltanto da [`LockedRoot::share`]. Configurazione e journal ne
+/// ricevono cloni distinti: ogni utilizzatore trattiene il lock finché vive e
+/// il sistema lo rilascia soltanto quando l'ultimo clone viene chiuso. Un
+/// accesso non può essere associato a un'altra radice: l'identità è quella
+/// della directory ancorata, non del percorso nominale.
+///
+/// Lo stesso accesso registra anche chi lo sta usando: al massimo uno [`Store`]
+/// della configurazione e un journal possono essere aperti sulla stessa radice,
+/// mentre due istanze dello stesso componente vengono rifiutate prima di
+/// leggere o toccare i file. Senza questa esclusione ognuna avrebbe il proprio
+/// mutex e non serializzerebbe le scritture dell'altra.
+///
+/// [`Store`]: crate::config::Store
+#[derive(Clone, Debug)]
+pub struct SharedRoot(Arc<LockedRoot>);
+
+impl SharedRoot {
+    /// Percorso della radice di stato ancorata.
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    /// Radice verificata e ancorata sottostante.
+    pub(crate) fn verified_root(&self) -> &VerifiedRoot {
+        self.0.verified_root()
+    }
+
+    /// Occupa lo slot del componente, o restituisce [`None`] se è già occupato.
+    ///
+    /// Il controllo avviene prima di qualunque accesso ai file di stato: una
+    /// seconda apertura dello stesso componente non arriva al motore del
+    /// journal né alla classificazione della configurazione.
+    pub(crate) fn claim(&self, consumer: Consumer) -> Option<RootClaim> {
+        let mut consumers = self
+            .0
+            .consumers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let slot = consumers.slot(consumer);
+        if *slot {
+            return None;
+        }
+        *slot = true;
+        Some(RootClaim {
+            root: self.clone(),
+            consumer,
+        })
+    }
+}
+
+impl From<LockedRoot> for SharedRoot {
+    fn from(root: LockedRoot) -> Self {
+        root.share()
     }
 }
 
@@ -312,6 +438,7 @@ pub fn lock(root: VerifiedRoot) -> Result<LockedRoot, PlatformError> {
                 root,
                 _file: file,
                 lock_path: path,
+                consumers: Mutex::new(Consumers::default()),
             }),
             Err(TryLockError::WouldBlock) => Err(PlatformError::AlreadyRunning { path }),
             Err(TryLockError::Error(source)) => Err(PlatformError::io(path, source)),

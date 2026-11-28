@@ -20,6 +20,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use totum_daemon::config::CONFIG_FILE;
 use totum_daemon::identity::{CONTROLLERS_FILE, IDENTITY_FILE};
+use totum_daemon::journal::JOURNAL_FILE;
 use totum_daemon::platform::{self, LOCK_FILE};
 
 const IDENTITY_INITIAL: &[u8] = b"{\"schemaVersion\":1,\"state\":\"notInitialized\"}\n";
@@ -285,7 +286,9 @@ fn names(directory: &Path) -> Vec<String> {
 fn assert_no_temporaries(directory: &Path) {
     for name in names(directory) {
         assert!(
-            !name.starts_with(".identity.") && !name.starts_with(".config."),
+            !name.starts_with(".identity.")
+                && !name.starts_with(".config.")
+                && !name.starts_with(".journal."),
             "temporaneo residuo: {name}"
         );
     }
@@ -340,17 +343,32 @@ fn first_run_creates_state_and_a_restart_does_not_rewrite_it() {
         stderr.contains("prima esecuzione: config.json creato alla revisione 0"),
         "prima esecuzione della configurazione:\n{stderr}"
     );
+    assert!(
+        stderr.contains(&format!("prima esecuzione: {JOURNAL_FILE} creato")),
+        "prima esecuzione del journal:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("bootstrap del journal interrotto"),
+        "una radice nuova non ha residui di bootstrap:\n{stderr}"
+    );
+    #[cfg(windows)]
+    assert!(
+        stderr.contains("durabilità della voce di directory non confermata"),
+        "su Windows la pubblicazione non è dichiarata durevole:\n{stderr}"
+    );
     first.stop();
 
     assert_eq!(read(&state, IDENTITY_FILE), IDENTITY_INITIAL);
     assert_eq!(read(&state, CONTROLLERS_FILE), CONTROLLERS_INITIAL);
     assert_eq!(read(&state, CONFIG_FILE), CONFIG_INITIAL);
+    assert!(state.join(JOURNAL_FILE).is_file());
     assert_eq!(
         names(&state),
         vec![
             CONFIG_FILE.to_owned(),
             CONTROLLERS_FILE.to_owned(),
             IDENTITY_FILE.to_owned(),
+            JOURNAL_FILE.to_owned(),
             LOCK_FILE.to_owned(),
         ],
         "nessun temporaneo o file inatteso"
@@ -388,6 +406,90 @@ fn inodes(directory: &Path) -> Vec<(String, u64)> {
             (name, value)
         })
         .collect()
+}
+
+#[test]
+fn an_interrupted_journal_bootstrap_is_reported_and_recovered() {
+    let scratch = Scratch::new("journal-residue");
+    let state = scratch.create_state();
+    scratch.write_file(&state, IDENTITY_FILE, IDENTITY_INITIAL);
+    scratch.write_file(&state, CONTROLLERS_FILE, CONTROLLERS_INITIAL);
+    scratch.write_file(&state, CONFIG_FILE, CONFIG_INITIAL);
+    scratch.write_file(&state, ".journal.4242.0.tmp", b"parziale");
+    #[cfg(unix)]
+    let config_inode = inode(&state.join(CONFIG_FILE));
+
+    let mut running = Running::spawn(scratch.base(), "journal-residue");
+    let stderr = running.wait_ready();
+    assert!(
+        stderr.contains(&format!(
+            "bootstrap del journal interrotto: 1 temporanei scartati, {JOURNAL_FILE} creato"
+        )),
+        "residuo di bootstrap segnalato:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("bootstrap del journal interrotto: 0"),
+        "il conteggio è quello dei residui osservati:\n{stderr}"
+    );
+    assert_eq!(read(&state, IDENTITY_FILE), IDENTITY_INITIAL);
+    assert_eq!(read(&state, CONTROLLERS_FILE), CONTROLLERS_INITIAL);
+    assert_eq!(read(&state, CONFIG_FILE), CONFIG_INITIAL);
+    #[cfg(unix)]
+    assert_eq!(
+        inode(&state.join(CONFIG_FILE)),
+        config_inode,
+        "la configurazione non viene riscritta"
+    );
+    assert!(state.join(JOURNAL_FILE).is_file());
+    assert_no_temporaries(&state);
+    running.stop();
+}
+
+#[test]
+fn a_corrupt_journal_blocks_readiness_with_a_diagnosis() {
+    let scratch = Scratch::new("journal-corrupt");
+    let state = scratch.create_state();
+    scratch.write_file(&state, IDENTITY_FILE, IDENTITY_INITIAL);
+    scratch.write_file(&state, CONTROLLERS_FILE, CONTROLLERS_INITIAL);
+    scratch.write_file(&state, CONFIG_FILE, CONFIG_INITIAL);
+    let corrupt = b"non e un journal redb";
+    scratch.write_file(&state, JOURNAL_FILE, corrupt);
+    #[cfg(unix)]
+    let config_inode = inode(&state.join(CONFIG_FILE));
+
+    let finished = run_to_exit(scratch.base(), &[]);
+    assert_eq!(
+        finished.status.code(),
+        Some(1),
+        "uscita operativa, non un uso scorretto:\n{}",
+        finished.stderr
+    );
+    assert!(
+        finished.stderr.contains("avvio non riuscito"),
+        "la diagnosi è un avvio non riuscito:\n{}",
+        finished.stderr
+    );
+    assert!(
+        finished.stderr.contains("apertura del journal fallita"),
+        "la diagnosi nomina il journal:\n{}",
+        finished.stderr
+    );
+    assert!(
+        finished.stderr.contains("journal inutilizzabile"),
+        "la causa è classificata, non un errore generico:\n{}",
+        finished.stderr
+    );
+    assert!(
+        !finished.stderr.contains(" pronto:"),
+        "nessuna prontezza dopo un errore bloccante:\n{}",
+        finished.stderr
+    );
+    assert_eq!(read(&state, JOURNAL_FILE), corrupt, "il file non è toccato");
+    assert_eq!(read(&state, CONFIG_FILE), CONFIG_INITIAL);
+    assert_eq!(read(&state, IDENTITY_FILE), IDENTITY_INITIAL);
+    #[cfg(unix)]
+    assert_eq!(inode(&state.join(CONFIG_FILE)), config_inode);
+    assert_no_temporaries(&state);
 }
 
 #[test]
@@ -680,12 +782,20 @@ fn a_second_instance_is_excluded_and_the_lock_is_reacquired_after_termination() 
     );
 
     first.stop();
+    #[cfg(unix)]
+    let journal_before = inode(&state.join(JOURNAL_FILE));
     let mut replacement = Running::spawn(scratch.base(), "replacement");
     replacement.wait_ready();
     assert_eq!(
         snapshot(&state),
         before,
         "la nuova istanza non riscrive nulla"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        inode(&state.join(JOURNAL_FILE)),
+        journal_before,
+        "il journal viene riaperto in loco, non pubblicato di nuovo"
     );
     replacement.stop();
 }
@@ -827,7 +937,12 @@ fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .map(|name| {
             let path = directory.join(&name);
-            let bytes = if name != LOCK_FILE && fs::symlink_metadata(&path).unwrap().is_file() {
+            // `journal.redb` è posseduto dal motore: una riapertura dopo una
+            // terminazione non pulita può riscrivere pagine interne. Contano
+            // il percorso e l'inode, non i byte; per gli altri file i byte
+            // restano confrontabili.
+            let compared = name != LOCK_FILE && name != JOURNAL_FILE;
+            let bytes = if compared && fs::symlink_metadata(&path).unwrap().is_file() {
                 fs::read(&path).expect("file leggibile")
             } else {
                 Vec::new()

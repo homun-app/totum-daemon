@@ -2,17 +2,18 @@
 name = "totum-daemon"
 version.workspace = true
 edition.workspace = true
-description = "Totum daemon: scaffold binaries plus the testable platform, config, identity and autostart modules (D3 P1-P9)"
+description = "Totum daemon: scaffold binaries plus the testable platform, config, identity, autostart and journal modules (D3 P1-P9, D4)"
 publish = false
 
 [lib]
 name = "totum_daemon"
 path = "src/lib.rs"
 
-# The platform and config modules are libraries only: no binary path uses them.
-# `serde`/`serde_json` are now normal dependencies for the versioned
-# configuration schema of D3 P3-P4 (AD-005), not only test dependencies.
+# `serde`/`serde_json` are normal dependencies for the versioned configuration
+# schema of D3 P3-P4 (AD-005); `redb` is the physical format of the journal (D4,
+# AD-014), always receiving a file already opened and verified by `platform`.
 [dependencies]
+redb = "=5.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

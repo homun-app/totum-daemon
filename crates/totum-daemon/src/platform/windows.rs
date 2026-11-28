@@ -273,6 +273,19 @@ impl VerifiedRoot {
     /// Un oggetto preesistente produce [`PlatformError::AlreadyExists`] e non
     /// viene seguito né modificato.
     pub fn create_file(&self, name: &OsStr) -> Result<File, PlatformError> {
+        self.create_named_file(name, GENERIC_WRITE)
+    }
+
+    /// Crea un file nuovo in lettura e scrittura, con la DACL protetta.
+    ///
+    /// È la primitiva richiesta dal journal: il backend riceve un handle già
+    /// verificato e non riapre mai il file per percorso. Un oggetto
+    /// preesistente produce [`PlatformError::AlreadyExists`].
+    pub(crate) fn create_read_write_file(&self, name: &OsStr) -> Result<File, PlatformError> {
+        self.create_named_file(name, GENERIC_READ | GENERIC_WRITE)
+    }
+
+    fn create_named_file(&self, name: &OsStr, access: u32) -> Result<File, PlatformError> {
         let name = validate_single_component(name)?;
         self.verify_path()?;
         let path = self.path.join(name);
@@ -283,7 +296,7 @@ impl VerifiedRoot {
         let raw = unsafe {
             fs::CreateFileW(
                 wide(&path).as_ptr(),
-                GENERIC_WRITE,
+                access,
                 0,
                 &security,
                 fs::CREATE_NEW,
@@ -307,6 +320,53 @@ impl VerifiedRoot {
         let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
 
         check_object(&handle, &path, &self.user, ObjectKind::File)?;
+        Ok(File::from(handle))
+    }
+
+    /// Apre un file di stato esistente in lettura e scrittura, senza crearlo.
+    ///
+    /// Un file assente produce [`PlatformError::FileAbsent`]; non esiste un
+    /// percorso di creazione implicita. Tipo, proprietario, DACL, reparse point
+    /// e assenza di collegamenti multipli sono verificati come per
+    /// [`Self::open_lock_file`].
+    pub(crate) fn open_existing_state_file(
+        &self,
+        name: &OsStr,
+        require_single_link: bool,
+    ) -> Result<File, PlatformError> {
+        let name = validate_single_component(name)?;
+        self.verify_path()?;
+        let path = self.path.join(name);
+        let share = fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE | fs::FILE_SHARE_DELETE;
+
+        // SAFETY: il percorso è valido e l'handle viene chiuso dal guard.
+        let raw = unsafe {
+            fs::CreateFileW(
+                wide(&path).as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                share,
+                ptr::null(),
+                fs::OPEN_EXISTING,
+                fs::FILE_ATTRIBUTE_NORMAL | fs::FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(file_open_error(&path, last_error()));
+        }
+        // SAFETY: l'handle è valido e non è usato altrove.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+
+        check_object(&handle, &path, &self.user, ObjectKind::File)?;
+        if require_single_link {
+            self.verify_path()?;
+            if file_information(handle.as_raw_handle(), &path)?.nNumberOfLinks != 1 {
+                return Err(PlatformError::AclViolation {
+                    path,
+                    detail: "file con più collegamenti".into(),
+                });
+            }
+        }
         Ok(File::from(handle))
     }
 

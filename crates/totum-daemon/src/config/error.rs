@@ -81,6 +81,10 @@ pub enum ConfigError {
     /// `config.json` è comparso durante la prima creazione: la destinazione non
     /// viene sovrascritta e serve una nuova classificazione.
     AppearedDuringFirstRun { path: PathBuf },
+    /// Un altro [`Store`](crate::config::Store) è già aperto sulla stessa
+    /// radice: una seconda istanza avrebbe il proprio mutex e non
+    /// serializzerebbe con la prima le scritture.
+    AlreadyOpen { path: PathBuf },
 }
 
 impl fmt::Display for ConfigError {
@@ -176,6 +180,11 @@ impl fmt::Display for ConfigError {
             ConfigError::AppearedDuringFirstRun { path } => write!(
                 f,
                 "{} è comparso durante la prima creazione: nessuna sovrascrittura",
+                path.display()
+            ),
+            ConfigError::AlreadyOpen { path } => write!(
+                f,
+                "configurazione già aperta su questa radice ({}): una seconda istanza non è ammessa",
                 path.display()
             ),
         }

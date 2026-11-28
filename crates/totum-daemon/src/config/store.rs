@@ -25,7 +25,7 @@ use super::{
     BackupState, CONFIG_FILE, CoherenceInput, ConfigV1, Decision, GenerationFailure,
     MigrationSource, classify, document, read_bounded,
 };
-use crate::platform::LockedRoot;
+use crate::platform::{Consumer, LockedRoot, RootClaim, SharedRoot};
 
 /// Classificazioni massime per un'apertura: una collisione in prima creazione
 /// richiede una nuova classificazione, senza cicli illimitati.
@@ -74,15 +74,16 @@ pub struct Startup {
 
 /// Configurazione aperta su una radice verificata, sotto il lock di istanza.
 ///
-/// Conserva la revisione caricata e la radice bloccata ottenuta con
+/// Conserva la revisione caricata e l'occupazione della radice ottenuta con
 /// [`platform::lock`](crate::platform::lock); ogni salvataggio rivalida i due
 /// file di configurazione su disco. Identità e registro non vengono riletti:
 /// la loro classificazione appartiene a P7.
 #[derive(Debug)]
 pub struct Store {
-    // Posseduto per tutta la vita dello `Store`: la radice e il lock sono un
-    // solo oggetto e non esiste un modo per rilasciare il lock separatamente.
-    locked: LockedRoot,
+    // Occupazione della radice per tutta la vita dello `Store`: trattiene il
+    // lock e impedisce un secondo `Store` sulla stessa radice. Lo stesso
+    // accesso può essere condiviso con il journal, che occupa l'altro slot.
+    claim: RootClaim,
     current: Mutex<ConfigV1>,
 }
 
@@ -106,9 +107,30 @@ impl Store {
         locked: LockedRoot,
         coherence: CoherenceInput,
     ) -> Result<(Store, Startup), ConfigError> {
-        let root = locked.verified_root();
-        let collision_path = root.path().join(CONFIG_FILE);
+        Self::open_shared(locked.share(), coherence)
+    }
+
+    /// Apre la configurazione con un accesso già condiviso alla radice.
+    ///
+    /// È il costruttore usato dall'avvio operativo, dove configurazione e
+    /// journal ricevono cloni dello stesso [`SharedRoot`]: il lock resta
+    /// acquisito finché l'ultimo utilizzatore vive. Un secondo [`Store`] sulla
+    /// stessa radice è rifiutato con [`ConfigError::AlreadyOpen`] prima di
+    /// leggere o scrivere i file, perché i mutex di due store indipendenti non
+    /// serializzerebbero fra loro le scritture. Il journal e la configurazione
+    /// occupano slot distinti e restano compatibili.
+    pub fn open_shared(
+        locked: SharedRoot,
+        coherence: CoherenceInput,
+    ) -> Result<(Store, Startup), ConfigError> {
+        let claim = locked
+            .claim(Consumer::Config)
+            .ok_or_else(|| ConfigError::AlreadyOpen {
+                path: locked.path().join(CONFIG_FILE),
+            })?;
+        let collision_path = locked.path().join(CONFIG_FILE);
         for _ in 0..MAX_OPEN_ATTEMPTS {
+            let root = claim.verified_root();
             match classify(root, coherence) {
                 Decision::Refused(error) => return Err(error),
                 Decision::MigrationRequired {
@@ -133,7 +155,7 @@ impl Store {
                     let (commit, preserved) =
                         write::migrate(root, source, &original, next, main_failure.as_ref())?;
                     return Ok((
-                        Store::with_config(locked, next),
+                        Store::with_config(claim, next),
                         Startup {
                             kind: StartupKind::Migrated {
                                 source,
@@ -151,7 +173,7 @@ impl Store {
                     match write::create_initial(root, config) {
                         Ok(commit) => {
                             return Ok((
-                                Store::with_config(locked, config),
+                                Store::with_config(claim, config),
                                 Startup {
                                     kind: StartupKind::FirstRun { commit },
                                     discarded_temporaries: discarded,
@@ -167,7 +189,7 @@ impl Store {
                 Decision::Normal { config, backup } => {
                     let discarded = write::discard_reserved_temporaries(root)?;
                     return Ok((
-                        Store::with_config(locked, config),
+                        Store::with_config(claim, config),
                         Startup {
                             kind: StartupKind::Normal { backup },
                             discarded_temporaries: discarded,
@@ -178,7 +200,7 @@ impl Store {
                     let discarded = write::discard_reserved_temporaries(root)?;
                     let (commit, preserved) = write::recover(root, backup, &main)?;
                     return Ok((
-                        Store::with_config(locked, backup),
+                        Store::with_config(claim, backup),
                         Startup {
                             kind: StartupKind::Recovered {
                                 backup,
@@ -197,9 +219,9 @@ impl Store {
         })
     }
 
-    fn with_config(locked: LockedRoot, config: ConfigV1) -> Self {
+    fn with_config(claim: RootClaim, config: ConfigV1) -> Self {
         Self {
-            locked,
+            claim,
             current: Mutex::new(config),
         }
     }
@@ -226,7 +248,7 @@ impl Store {
     /// durabilità non confermata, e neppure quello va ritentato.
     pub fn save(&self) -> Result<Commit, ConfigError> {
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-        let commit = write::save(self.locked.verified_root(), *current)?;
+        let commit = write::save(self.claim.verified_root(), *current)?;
         *current = ConfigV1::with_revision(commit.revision());
         Ok(commit)
     }

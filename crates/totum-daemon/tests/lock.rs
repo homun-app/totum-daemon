@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 use totum_daemon::config::{
-    CONFIG_BACKUP_FILE, CONFIG_FILE, CoherenceInput, ComponentState, Store,
+    CONFIG_BACKUP_FILE, CONFIG_FILE, CoherenceInput, ComponentState, ConfigError, Store,
 };
 use totum_daemon::platform::{self, LOCK_FILE, PlatformError, VerifiedRoot};
 
@@ -100,6 +100,36 @@ fn inode(path: &Path) -> u64 {
 fn open_store(root: VerifiedRoot) -> (Store, totum_daemon::config::Startup) {
     let locked = platform::lock(root).expect("lock di istanza acquisito");
     Store::open(locked, COHERENT).expect("apertura riuscita")
+}
+
+#[test]
+fn a_second_store_on_the_same_shared_root_is_refused() {
+    let scratch = Scratch::new("second-store");
+    let directory = scratch.path.join("totum");
+    let shared = platform::lock(scratch.root())
+        .expect("lock di istanza acquisito")
+        .share();
+    let (first, _) = Store::open_shared(shared.clone(), COHERENT).expect("prima apertura");
+    let before = read(&directory, CONFIG_FILE);
+    #[cfg(unix)]
+    let before_inode = inode(&directory.join(CONFIG_FILE));
+
+    match Store::open_shared(shared.clone(), COHERENT) {
+        Err(ConfigError::AlreadyOpen { .. }) => {}
+        Err(other) => panic!("errore inatteso: {other:?}"),
+        Ok(_) => panic!("due Store indipendenti sulla stessa radice non devono coesistere"),
+    }
+    assert_eq!(
+        read(&directory, CONFIG_FILE),
+        before,
+        "il rifiuto non scrive la configurazione"
+    );
+    #[cfg(unix)]
+    assert_eq!(inode(&directory.join(CONFIG_FILE)), before_inode);
+
+    drop(first);
+    let (_second, _) = Store::open_shared(shared, COHERENT).expect("riapertura dopo la chiusura");
+    assert_eq!(read(&directory, CONFIG_FILE), before);
 }
 
 /// Coordinazione dell'harness fra avvio dei processi figli e transizioni del

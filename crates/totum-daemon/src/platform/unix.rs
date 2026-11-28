@@ -242,10 +242,23 @@ impl VerifiedRoot {
     /// un collegamento simbolico, produce [`PlatformError::AlreadyExists`] e
     /// non viene seguito né modificato.
     pub fn create_file(&self, name: &OsStr) -> Result<File, PlatformError> {
+        self.create_named_file(name, OFlags::WRONLY)
+    }
+
+    /// Crea un file nuovo in lettura e scrittura, con le stesse garanzie di
+    /// [`Self::create_file`].
+    ///
+    /// È la primitiva richiesta dal journal: il backend riceve un descrittore
+    /// già verificato e non riapre mai il file per percorso. Un oggetto
+    /// preesistente produce [`PlatformError::AlreadyExists`].
+    pub(crate) fn create_read_write_file(&self, name: &OsStr) -> Result<File, PlatformError> {
+        self.create_named_file(name, OFlags::RDWR)
+    }
+
+    fn create_named_file(&self, name: &OsStr, access: OFlags) -> Result<File, PlatformError> {
         let name = validate_single_component(name)?;
         let path = self.path.join(name);
-        let flags =
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let flags = access | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let descriptor = rfs::openat(&self.directory, name, flags, Mode::RUSR | Mode::WUSR)
             .map_err(|errno| {
                 if errno == Errno::EXIST {
@@ -323,11 +336,51 @@ impl VerifiedRoot {
             Err(errno) => return Err(map_open_error(&path, errno)),
         };
 
+        self.finish_state_file(descriptor, path, false)
+    }
+
+    /// Apre un file di stato esistente in lettura e scrittura, senza crearlo.
+    ///
+    /// Un file assente produce [`PlatformError::FileAbsent`]; non esiste un
+    /// percorso di creazione implicita. Tipo, proprietario, modalità, ACL e
+    /// assenza di collegamenti multipli sono verificati come per
+    /// [`Self::open_lock_file`]. È la primitiva con cui il journal apre un
+    /// file preesistente che non deve essere inizializzato per omissione.
+    pub(crate) fn open_existing_state_file(
+        &self,
+        name: &OsStr,
+        require_single_link: bool,
+    ) -> Result<File, PlatformError> {
+        let name = validate_single_component(name)?;
+        let path = self.path.join(name);
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let descriptor = rfs::openat(&self.directory, name, flags, Mode::empty())
+            .map_err(|errno| map_file_open_error(&path, errno))?;
+        self.finish_state_file(descriptor, path, require_single_link)
+    }
+
+    fn finish_state_file(
+        &self,
+        descriptor: OwnedFd,
+        path: PathBuf,
+        require_single_link: bool,
+    ) -> Result<File, PlatformError> {
         let stat = fstat(&descriptor, &path)?;
         verify_file(&stat, &path)?;
         check_acl(descriptor.as_fd(), &path, super::AclPolicy::OwnerOnly)?;
         rfs::fcntl_setfl(&descriptor, OFlags::empty())
             .map_err(|errno| PlatformError::io(&path, errno))?;
+        if require_single_link
+            && rfs::fstat(&descriptor)
+                .map_err(|errno| PlatformError::io(&path, errno))?
+                .st_nlink
+                != 1
+        {
+            return Err(PlatformError::AclViolation {
+                path,
+                detail: "file con più collegamenti".into(),
+            });
+        }
         Ok(File::from(descriptor))
     }
 

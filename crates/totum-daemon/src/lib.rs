@@ -20,6 +20,7 @@
 pub mod autostart;
 pub mod config;
 pub mod identity;
+pub mod journal;
 pub mod platform;
 pub mod startup;
 

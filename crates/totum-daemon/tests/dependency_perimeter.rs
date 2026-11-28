@@ -18,8 +18,9 @@ const WORKSPACE_PACKAGES: [&str; 3] = ["totum-cli", "totum-contract", "totum-dae
 
 /// Dipendenze esterne ammesse: `serde` e `serde_json` per i contratti D2 e per
 /// la configurazione D3 P3, più `rustix` su Unix e `windows-sys` su Windows per
-/// il modulo `platform` di D3, con il loro intero albero dal registro pubblico.
-const APPROVED_DEPENDENCIES: [&str; 18] = [
+/// il modulo `platform` di D3, `redb` per il journal D4 (AD-014), con il loro
+/// intero albero dal registro pubblico.
+const APPROVED_DEPENDENCIES: [&str; 19] = [
     "bitflags",
     "errno",
     "itoa",
@@ -28,6 +29,7 @@ const APPROVED_DEPENDENCIES: [&str; 18] = [
     "memchr",
     "proc-macro2",
     "quote",
+    "redb",
     "rustix",
     "serde",
     "serde_core",
@@ -42,9 +44,10 @@ const APPROVED_DEPENDENCIES: [&str; 18] = [
 
 /// Dipendenze esterne dirette ammesse per ogni pacchetto del workspace, con i
 /// tipi effettivamente dichiarati: normali, di sviluppo o di build.
-const WORKSPACE_EDGES: [(&str, &str, &[&str]); 6] = [
+const WORKSPACE_EDGES: [(&str, &str, &[&str]); 7] = [
     ("totum-contract", "serde", &["normal"]),
     ("totum-contract", "serde_json", &["normal"]),
+    ("totum-daemon", "redb", &["normal"]),
     ("totum-daemon", "rustix", &["normal", "dev"]),
     ("totum-daemon", "serde", &["normal"]),
     ("totum-daemon", "serde_json", &["normal"]),
@@ -54,7 +57,8 @@ const WORKSPACE_EDGES: [(&str, &str, &[&str]); 6] = [
 
 /// Dipendenze esterne dirette ammesse fra pacchetti del registro: ogni altra
 /// combinazione allarga il perimetro senza una decisione registrata.
-const EXTERNAL_EDGES: [(&str, &[&str]); 10] = [
+const EXTERNAL_EDGES: [(&str, &[&str]); 11] = [
+    ("redb", &["libc"]),
     ("errno", &["libc", "windows_sys"]),
     (
         "rustix",
