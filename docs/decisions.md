@@ -619,8 +619,8 @@ nominale, quindi una rinomina o una sostituzione del nome non cambia il file
 misurato. La misura è diagnostica: se è indisponibile dopo il commit l'esito
 riporta comunque l'avanzamento già applicato, con `physical_bytes` a `None`, e
 non restituisce un errore che nasconderebbe un floor già avanzato. Il budget
-fisico e il blocco delle nuove scritture previsti dal piano D4 restano da
-completare.
+fisico e il blocco delle nuove scritture sono descritti nella sottosezione
+seguente.
 
 **Crash e commit.** Esistono punti d'arresto deterministici, attivi solo nelle
 prove, prima e dopo il commit di snapshot, retention e reset. Un arresto prima
@@ -648,3 +648,92 @@ terminazione non ordinata del processo. Le prove sintetiche non dimostrano una
 riduzione fisica del file, la durabilità alla perdita di alimentazione né
 l'isolamento fra account; il target Windows e le suite di stato restano da
 rieseguire sui runner nativi.
+
+### Budget fisico e rifiuto delle nuove scritture
+
+**Data:** 28 novembre 2026. **Stato:** accettata come chiusura del perimetro D4,
+autorizzata dall'utente. **Ambito:** `journal::JournalBudget`,
+`Journal::with_budget`, `append`, `snapshot`, `retain`, `reset`, migrazione dello
+schema 1.
+
+**Tre misure distinte.** I byte logici sono la somma dei payload conservati e
+restano la soglia della retention. La lunghezza effettiva del file `journal.redb`
+è la misura limitata dal budget. Lo spazio allocato dal filesystem è una
+proprietà del supporto, non misurata qui. La lunghezza è letta dall'handle
+verificato e aperto dal backend, mai dal percorso nominale, e con la stessa
+lettura si aggiorna la diagnostica `physical_bytes`.
+
+**Contratto.** `JournalBudget { max_file_bytes, maintenance_reserve }` con
+`0 < maintenance_reserve < max_file_bytes`. `max_file_bytes` è la lunghezza
+massima che una scrittura può far raggiungere al file; `maintenance_reserve` è la
+parte che gli append non possono consumare e resta disponibile a snapshot,
+retention, reset, migrazione e recupero, quindi gli append si fermano a
+`max_file_bytes - maintenance_reserve`. Il valore applicato da `Journal::open` è
+`JournalBudget::FIXTURE`, 8 MiB con 4 MiB di riserva, la stessa soglia di prova
+del piano: non è un default di prodotto né una scelta su Q23. `with_budget`
+sostituisce il budget di un'istanza senza toccare il file e rifiuta un budget
+incoerente con `InvalidBudget` prima di qualunque scrittura.
+
+**Punto di applicazione.** Nel sorgente di `redb =5.0.0` l'estensione del file
+avviene in `PageManager::allocate_helper` → `grow()` → `set_len`, durante le
+operazioni sulle tabelle; il commit durabile può a sua volta allocare pagine di
+sistema (`store_data_freed_pages`, `reserve_allocator_state`,
+`flush_data_allocated_pages`), quindi non esiste un punto in cui la dimensione
+sia garantita in anticipo. Il journal misura la lunghezza già raggiunta dalla transazione, prima del
+checkpoint e del commit. Se la transazione ha esteso il file oltre il limite,
+esegue l'annullamento esplicito con `WriteTransaction::abort`; `rollback_growth`
+riporta il file al layout iniziale, quindi la crescita non pubblicata sparisce.
+L'esito è `CapacityExhausted { limit, file_bytes }` soltanto se l'annullamento
+riesce; se fallisce l'esito è `RollbackFailed { limit, file_bytes, detail }`,
+l'istanza richiede la riapertura e non accetta altri batch. Lo stesso
+annullamento vale per ogni operazione che controlla prima del commit: append,
+snapshot, retention, reset e migrazione. Una scrittura che riusa spazio già
+allocato non estende il file e resta ammessa anche quando la manutenzione lo ha
+portato oltre la soglia degli append: il budget governa l'estensione, non la
+dimensione iniziale di un file esistente. Il bootstrap non è limitato perché
+crea il solo schema, senza eventi, nel temporaneo che diventa il principale; la
+migrazione dello schema 1 usa il limite pieno perché aggiunge i tempi degli
+eventi.
+
+**Rifiuto ed errori.** Quando la soglia scatta la transazione è già partita: non
+è mai stata confermata, e dopo un annullamento riuscito redb ha ripristinato le
+allocazioni, quindi nessun nuovo evento, sequenza, metadato o epoch è visibile e
+l'istanza resta utilizzabile. Un annullamento fallito non viene presentato come
+capacità esaurita: è `RollbackFailed`, impone la riapertura e nessuna nuova
+scrittura è accettata prima del recupero. Non esistono ritentativi automatici.
+Un errore di commit resta `CommitOutcomeUnknown` con obbligo di riapertura. La
+misura del controllo è richiesta e fallisce chiusa; la misura diagnostica
+esposta dagli esiti resta `None` senza nascondere un commit riuscito.
+
+**Recupero verificato.** Le prove coprono la soglia esatta (ammessa), un byte
+sotto (rifiutata con la stessa crescita) e oltre (rifiutata), il rifiuto
+ripetuto deterministico con stato identico, la retention bloccata per snapshot
+assente, lo snapshot e la retention ammessi dentro la riserva, e la ripresa
+degli append dopo la retention: le pagine allocate calano mentre il file non è
+necessariamente più corto, quindi lo spazio riutilizzato dentro redb è distinto
+dal troncamento; epoch, floor, high-water e sequenze restano coerenti. La
+riapertura dopo un rifiuto è provata in un secondo processo reale, che trova lo
+stato committato intatto, aggiunge un evento e lo lascia visibile al padre. Il
+ramo di annullamento fallito, non producibile con redb reale, è esercitato con
+un guasto simulato: l'esito è `RollbackFailed`, `append` e `statistics`
+rispondono `RecoveryRequired` e la riapertura riparte dallo stato committato,
+senza eventi del batch rifiutato.
+
+**Limiti dichiarati.** La soglia è preventiva, non un tetto rigido. Le
+estensioni di redb sono geometriche: una transazione può superare il limite nel
+proprio passo, quindi il rifiuto arriva prima del byte esatto e la capacità
+utile degli append è quella dello scalino precedente. Il commit durabile può
+allocare pagine di sistema dopo la misura, quindi la lunghezza finale può
+superare il picco misurato; la riserva di manutenzione è per scelta disponibile
+oltre la soglia degli append e il ripristino eseguito da redb alla riapertura
+non è governato dal budget. Non è dimostrabile un tetto fisico: `redb =5.0.0`
+non espone un limite di dimensione, e rifiutare la crescita nel backend non è
+un'alternativa, perché una `set_len` fallita blocca il backend (`io_failed`),
+impedisce anche `rollback_growth` e rende il recupero inaffidabile. Il requisito
+del tetto rigido resta aperto. redb può inoltre ridurre la coda libera al
+commit, quindi una transazione rifiutata avrebbe potuto produrre un file più
+corto della soglia. Il journal non chiama `compact()` e non tronca il file: lo
+spazio riutilizzabile interno non riduce la lunghezza, e un file già oltre la
+soglia resta scrivibile solo senza crescita. La durabilità alla perdita di
+alimentazione non è provata; le suite `journal` su Windows e Linux restano da
+eseguire sui runner nativi.

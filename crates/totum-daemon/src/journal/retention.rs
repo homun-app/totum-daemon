@@ -94,6 +94,7 @@ impl Journal {
         }
         let now_ms = millis(now);
         let max_age_ms = u64::try_from(limits.max_age.as_millis()).unwrap_or(u64::MAX);
+        let started = self.file_bytes()?;
         let transaction = self.db.begin_write().map_err(storage)?;
 
         let (epoch_floor_high, items, snapshot) = {
@@ -219,6 +220,12 @@ impl Journal {
             meta.insert(META_FLOOR, required).map_err(storage)?;
         }
 
+        // La rimozione libera pagine ma il commit può registrarle nel sistema:
+        // vale il limite pieno, con la riserva disponibile alla manutenzione.
+        // Superato il limite la transazione già aperta viene annullata
+        // esplicitamente: `CapacityExhausted` solo se riesce, altrimenti
+        // `RollbackFailed` con riapertura obbligatoria.
+        let transaction = self.guard_capacity(transaction, self.budget.max_file_bytes, started)?;
         checkpoint(Step::RetainBeforeCommit, &self.path)?;
         if let Err(error) = transaction.commit() {
             self.recovery_required = true;

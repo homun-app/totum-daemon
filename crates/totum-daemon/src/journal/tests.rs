@@ -9,8 +9,8 @@ use redb::{ReadableDatabase as _, ReadableTableMetadata as _};
 
 use super::{JOURNAL_FILE, Step, fault, reserved_temporaries};
 use crate::journal::{
-    Event, Journal, JournalError, Position, ReducerState, RetentionLimits, RetentionOutcome,
-    StartupKind,
+    Event, Journal, JournalBudget, JournalError, Position, ReducerState, RetentionLimits,
+    RetentionOutcome, StartupKind,
 };
 use crate::platform::{self, LOCK_FILE, SharedRoot, VerifiedRoot};
 
@@ -1288,6 +1288,323 @@ fn a_measurement_failure_does_not_hide_a_committed_retention() {
         (2, 2, 0)
     );
     assert!(stats.physical_bytes.is_some());
+}
+
+/// Prova il batch che deve estendere il file con un limite coincidente con la
+/// lunghezza attuale e restituisce la lunghezza che avrebbe raggiunto.
+fn refused_growth(journal: Journal, limit: u64, batch: &[&[u8]]) -> (Journal, u64) {
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: limit + 1,
+            maintenance_reserve: 1,
+        })
+        .unwrap();
+    match journal.append(batch).unwrap_err() {
+        JournalError::CapacityExhausted {
+            limit: actual,
+            file_bytes,
+        } => {
+            assert_eq!(actual, limit);
+            assert!(file_bytes > limit, "{file_bytes} <= {limit}");
+            (journal, file_bytes)
+        }
+        other => panic!("esito inatteso: {other:?}"),
+    }
+}
+
+#[test]
+fn an_invalid_budget_is_refused_without_touching_the_file() {
+    let dir = Scratch::new();
+    let (journal, _) = Journal::open(dir.shared()).unwrap();
+    let bytes = journal.statistics().unwrap().physical_bytes.unwrap();
+    drop(journal);
+
+    for budget in [
+        JournalBudget {
+            max_file_bytes: 0,
+            maintenance_reserve: 0,
+        },
+        JournalBudget {
+            max_file_bytes: bytes,
+            maintenance_reserve: bytes,
+        },
+        JournalBudget {
+            max_file_bytes: 10,
+            maintenance_reserve: 11,
+        },
+    ] {
+        let (journal, _) = Journal::open(dir.shared()).unwrap();
+        let before = std::fs::metadata(dir.root().join(JOURNAL_FILE))
+            .unwrap()
+            .len();
+        let error = journal.with_budget(budget).expect_err("budget rifiutato");
+        assert!(
+            matches!(error, JournalError::InvalidBudget { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.root().join(JOURNAL_FILE))
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+}
+
+#[test]
+fn an_append_that_would_extend_the_file_past_the_budget_is_refused_and_leaves_no_trace() {
+    let dir = Scratch::new();
+    let (journal, _) = Journal::open(dir.shared()).unwrap();
+    let baseline = journal.statistics().unwrap();
+    let bytes = baseline.physical_bytes.unwrap();
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: bytes + 1,
+            maintenance_reserve: 1,
+        })
+        .unwrap();
+
+    let payload = [0x5au8; 64 * 1024];
+    let batch = [payload.as_slice(); 16];
+    // Il rifiuto è deterministico: nessun ritentativo automatico e la stessa
+    // istanza resta nello stato committato, senza crescere oltre il file.
+    for _ in 0..2 {
+        match journal.append(&batch).unwrap_err() {
+            JournalError::CapacityExhausted { limit, file_bytes } => {
+                assert_eq!(limit, bytes);
+                assert!(file_bytes > bytes);
+            }
+            other => panic!("esito inatteso: {other:?}"),
+        }
+        assert_eq!(journal.statistics().unwrap(), baseline);
+        assert_eq!(journal.statistics().unwrap().physical_bytes, Some(bytes));
+    }
+
+    // L'istanza non è avvelenata: un budget che ammette la crescita accetta.
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: 64 * 1024 * 1024,
+            maintenance_reserve: 0,
+        })
+        .unwrap();
+    assert_eq!(journal.append(&[b"after"]).unwrap(), 1..=1);
+    assert_eq!(journal.read_after(0, 1).unwrap(), vec![event(1, b"after")]);
+}
+
+#[test]
+fn a_failed_rollback_requires_reopen_instead_of_declaring_capacity_exhausted() {
+    let dir = Scratch::new();
+    let (journal, _) = Journal::open(dir.shared()).unwrap();
+    let epoch = journal.epoch().unwrap();
+    let bytes = journal.statistics().unwrap().physical_bytes.unwrap();
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: bytes + 1,
+            maintenance_reserve: 1,
+        })
+        .unwrap();
+    let payload = [0x42u8; 64 * 1024];
+    let batch = [payload.as_slice(); 16];
+
+    fault::fail_abort(true);
+    let error = journal.append(&batch).unwrap_err();
+    fault::fail_abort(false);
+
+    match error {
+        JournalError::RollbackFailed {
+            limit,
+            file_bytes,
+            detail,
+        } => {
+            assert_eq!(limit, bytes);
+            assert!(file_bytes > bytes, "{file_bytes} <= {bytes}");
+            assert!(!detail.is_empty());
+        }
+        other => panic!("esito inatteso: {other:?}"),
+    }
+
+    // L'annullamento non è riuscito: l'istanza non dichiara capacità esaurita
+    // e non accetta altri batch, ma richiede la riapertura.
+    assert!(matches!(
+        journal.append(&[b"later"]).unwrap_err(),
+        JournalError::RecoveryRequired
+    ));
+    assert!(matches!(
+        journal.statistics().unwrap_err(),
+        JournalError::RecoveryRequired
+    ));
+    drop(journal);
+
+    // La riapertura riparte dallo stato committato: nessun evento e nessuna
+    // sequenza del batch rifiutato sono visibili.
+    let mut journal = journal_reopened(&dir, epoch);
+    let stats = journal.statistics().unwrap();
+    assert_eq!((stats.floor, stats.high_water, stats.events), (0, 0, 0));
+    assert_eq!(journal.append(&[b"fresh"]).unwrap(), 1..=1);
+}
+
+#[test]
+fn the_append_limit_is_inclusive_and_one_byte_below_refuses_the_same_growth() {
+    let payload = [0x77u8; 8 * 1024];
+    let batch = [payload.as_slice(); 16];
+
+    let probe = Scratch::new();
+    let (journal, _) = Journal::open(probe.shared()).unwrap();
+    let bytes0 = journal.statistics().unwrap().physical_bytes.unwrap();
+    let (journal, grown) = refused_growth(journal, bytes0, &batch);
+    assert_eq!(journal.statistics().unwrap().physical_bytes, Some(bytes0));
+    drop(journal);
+
+    // Al limite: la lunghezza che la transazione raggiunge coincide con la
+    // soglia e la scrittura è ammessa. La lunghezza dopo il commit può essere
+    // minore, perché redb può ridurre la coda libera.
+    let at = Scratch::new();
+    let (journal, _) = Journal::open(at.shared()).unwrap();
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: grown,
+            maintenance_reserve: 0,
+        })
+        .unwrap();
+    assert_eq!(journal.append(&batch).unwrap(), 1..=16);
+    let stats = journal.statistics().unwrap();
+    assert_eq!(stats.high_water, 16);
+    assert!(stats.physical_bytes.unwrap() <= grown);
+
+    // Un byte sotto: la stessa crescita è rifiutata e il file resta quello
+    // iniziale. La soglia è preventiva rispetto alla lunghezza finale, che
+    // redb avrebbe potuto ridurre al commit.
+    let below = Scratch::new();
+    let (journal, _) = Journal::open(below.shared()).unwrap();
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: grown - 1,
+            maintenance_reserve: 0,
+        })
+        .unwrap();
+    match journal.append(&batch).unwrap_err() {
+        JournalError::CapacityExhausted { limit, file_bytes } => {
+            assert_eq!(limit, grown - 1);
+            assert_eq!(file_bytes, grown);
+        }
+        other => panic!("esito inatteso: {other:?}"),
+    }
+    assert_eq!(journal.statistics().unwrap().physical_bytes, Some(bytes0));
+}
+
+#[test]
+fn a_refused_append_leaves_room_for_snapshot_retention_and_resumed_appends() {
+    let dir = Scratch::new();
+    let (journal, _) = Journal::open(dir.shared()).unwrap();
+    let epoch = journal.epoch().unwrap();
+    let bytes0 = journal.statistics().unwrap().physical_bytes.unwrap();
+    let payload = [0x33u8; 8 * 1024];
+    let batch = [payload.as_slice(); 16];
+
+    // La crescita che il primo batch raggiungerebbe è la soglia degli append:
+    // con quella soglia il batch entra, il secondo che deve crescere no.
+    let (journal, grown) = refused_growth(journal, bytes0, &batch);
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: grown,
+            maintenance_reserve: 0,
+        })
+        .unwrap();
+    assert_eq!(journal.append(&batch).unwrap(), 1..=16);
+    let allocated_before = journal.allocated_bytes().unwrap();
+    let (journal, second) = refused_growth(journal, grown, &batch);
+    drop(journal);
+
+    // Senza snapshot la retention non può rimuovere il prefisso.
+    let mut journal = journal_reopened(&dir, epoch);
+    let blocked = journal
+        .retain(
+            RetentionLimits {
+                max_logical_bytes: 0,
+                max_age: Duration::MAX,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            blocked,
+            RetentionOutcome::Blocked {
+                snapshot_through: None,
+                ..
+            }
+        ),
+        "esito inatteso: {blocked:?}"
+    );
+    assert_eq!(journal.statistics().unwrap().events, 16);
+
+    // La riserva serve alla manutenzione: con il limite pieno lo snapshot e la
+    // retention possono estendere il file oltre la soglia degli append.
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: second,
+            maintenance_reserve: second - grown,
+        })
+        .unwrap();
+    journal.snapshot().unwrap();
+    let outcome = journal
+        .retain(
+            RetentionLimits {
+                max_logical_bytes: 0,
+                max_age: Duration::MAX,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            RetentionOutcome::Advanced {
+                from_floor: 0,
+                to_floor: 16,
+                removed: 16,
+                ..
+            }
+        ),
+        "esito inatteso: {outcome:?}"
+    );
+
+    // Spazio riutilizzabile dentro redb: le pagine allocate calano mentre il
+    // file non è necessariamente più corto. È il riuso, non un troncamento.
+    let allocated_after = journal.allocated_bytes().unwrap();
+    let physical_after = journal.statistics().unwrap().physical_bytes.unwrap();
+    assert!(
+        allocated_after < allocated_before,
+        "pagine allocate {allocated_after} >= {allocated_before}"
+    );
+    assert!(physical_after <= second);
+    let stats = journal.statistics().unwrap();
+    assert_eq!(
+        (stats.epoch, stats.floor, stats.high_water, stats.events),
+        (epoch, 16, 16, 0)
+    );
+
+    // Gli append riprendono senza superare la soglia: la nuova sequenza segue
+    // il floor e non riusa numeri rimossi.
+    assert_eq!(journal.append(&[b"resume"]).unwrap(), 17..=17);
+    let stats = journal.statistics().unwrap();
+    assert_eq!((stats.floor, stats.high_water, stats.events), (16, 17, 1));
+    assert_eq!(
+        journal
+            .read_from(Position::new(epoch, 16), 2)
+            .unwrap()
+            .events,
+        vec![event(17, b"resume")]
+    );
+    assert!(stats.physical_bytes.unwrap() <= second);
+}
+
+/// Riapre lo stesso journal con il budget predefinito, conservando epoch e
+/// stato: le prove non devono dipendere dall'ordine delle istanze.
+fn journal_reopened(dir: &Scratch, epoch: u64) -> Journal {
+    let (journal, _) = Journal::open(dir.shared()).unwrap();
+    assert_eq!(journal.epoch().unwrap(), epoch);
+    journal
 }
 
 #[test]

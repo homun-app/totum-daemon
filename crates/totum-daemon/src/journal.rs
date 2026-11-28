@@ -81,7 +81,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{
     BackendError, Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable,
-    ReadableTableMetadata, StorageBackend, TableDefinition,
+    ReadableTableMetadata, StorageBackend, TableDefinition, WriteTransaction,
 };
 
 use crate::platform::{
@@ -98,6 +98,79 @@ pub const JOURNAL_FILE: &str = "journal.redb";
 pub const SCHEMA_VERSION: u64 = 2;
 /// Schema precedente compreso come sorgente di una migrazione in avanti.
 pub const LEGACY_SCHEMA_VERSION: u64 = 1;
+
+/// Budget della crescita del journal.
+///
+/// La misura limitata è la lunghezza effettiva del file `journal.redb` aperto e
+/// verificato da Totum, letta dall'handle del backend: non la somma dei payload
+/// (byte logici, già governati dalla retention) né lo spazio allocato dal
+/// filesystem, che resta una diagnostica separata. Il limite si applica alla
+/// lunghezza che una transazione ha già raggiunto, prima del commit: redb
+/// estende il file mentre alloca le pagine e non offre un controllo preventivo,
+/// quindi il rifiuto avviene sul risultato reale e l'annullamento esplicito
+/// ripristina la crescita non pubblicata.
+///
+/// Una scrittura che riusa spazio già allocato non estende il file e resta
+/// ammessa anche quando la manutenzione lo ha portato sopra la soglia degli
+/// append: il budget governa l'estensione, non la dimensione iniziale di un
+/// file esistente. `maintenance_reserve` è la parte di `max_file_bytes` che gli
+/// append non possono consumare: snapshot, retention, reset, migrazione e
+/// recupero possono usarla.
+///
+/// Il controllo avviene su una transazione già aperta: se la misura supera il
+/// limite, Totum annulla esplicitamente la transazione e restituisce
+/// [`JournalError::CapacityExhausted`] soltanto se l'annullamento riesce. In
+/// quel caso redb ha ripristinato la crescita non pubblicata e nessun nuovo
+/// evento, sequenza o metadato è visibile; l'istanza resta utilizzabile. Un
+/// annullamento fallito produce [`JournalError::RollbackFailed`] e impone la
+/// riapertura.
+///
+/// La soglia è preventiva, non un tetto rigido. redb 5.0.0 non offre un limite
+/// di dimensione: estende il file geometricamente dentro la transazione, e il
+/// commit durabile può a sua volta allocare pagine di sistema (registro delle
+/// pagine liberate e stato degli allocatori), quindi può superare il picco
+/// misurato poco prima. Impedire la crescita nel backend non è un'alternativa
+/// affidabile: una `set_len` rifiutata blocca permanentemente il backend
+/// (`io_failed`), impedisce anche il ripristino della crescita e rende il
+/// recupero inaffidabile. Le fasi che possono oltrepassare la soglia sono
+/// quindi il commit durabile, la riserva di manutenzione (per scelta) e il
+/// ripristino eseguito da redb alla riapertura; il tetto rigido resta un
+/// requisito aperto.
+///
+/// Il file non viene compattato né troncato: lo spazio riutilizzabile al suo
+/// interno non riduce la lunghezza. Il bootstrap non è limitato: crea il solo
+/// schema, senza eventi, nel temporaneo che diventa il principale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalBudget {
+    /// Lunghezza massima che una scrittura può far raggiungere al file.
+    pub max_file_bytes: u64,
+    /// Parte del limite non disponibile agli append.
+    pub maintenance_reserve: u64,
+}
+
+impl JournalBudget {
+    /// Soglia provvisoria delle prove e di [`Journal::open`], finché il
+    /// proprietario non decide un valore di prodotto: non è una scelta su Q23.
+    pub const FIXTURE: Self = Self {
+        max_file_bytes: 8 * 1024 * 1024,
+        maintenance_reserve: 4 * 1024 * 1024,
+    };
+
+    /// Limite applicato agli append, che lascia intatta la riserva.
+    pub fn append_limit(&self) -> u64 {
+        self.max_file_bytes - self.maintenance_reserve
+    }
+
+    fn validate(self) -> Result<Self, JournalError> {
+        if self.max_file_bytes == 0 || self.maintenance_reserve >= self.max_file_bytes {
+            return Err(JournalError::InvalidBudget {
+                max_file_bytes: self.max_file_bytes,
+                maintenance_reserve: self.maintenance_reserve,
+            });
+        }
+        Ok(self)
+    }
+}
 
 /// Namespace riservato ai temporanei di bootstrap del journal.
 const TEMP_PREFIX: &str = ".journal.";
@@ -233,6 +306,27 @@ pub enum JournalError {
         path: PathBuf,
     },
     RecoveryRequired,
+    /// Il budget è incoerente: limite nullo o riserva non inferiore al limite.
+    InvalidBudget {
+        max_file_bytes: u64,
+        maintenance_reserve: u64,
+    },
+    /// La scrittura ha esteso il file oltre il budget con la transazione già
+    /// aperta. L'annullamento esplicito è riuscito: redb ha ripristinato la
+    /// crescita non pubblicata, quindi nessun nuovo evento, sequenza, metadato
+    /// o epoch è visibile e l'istanza resta utilizzabile.
+    CapacityExhausted {
+        limit: u64,
+        file_bytes: u64,
+    },
+    /// La scrittura ha superato il budget e l'annullamento esplicito è fallito:
+    /// lo stato del motore non è noto e la riapertura è obbligatoria. Nessun
+    /// nuovo batch viene accettato prima del recupero.
+    RollbackFailed {
+        limit: u64,
+        file_bytes: u64,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for JournalError {
@@ -294,6 +388,25 @@ impl std::fmt::Display for JournalError {
             JournalError::RecoveryRequired => {
                 write!(f, "journal in attesa di riapertura: nessun nuovo batch")
             }
+            JournalError::InvalidBudget {
+                max_file_bytes,
+                maintenance_reserve,
+            } => write!(
+                f,
+                "budget del journal non valido: limite {max_file_bytes} byte, riserva di manutenzione {maintenance_reserve} byte (la riserva deve essere inferiore al limite)"
+            ),
+            JournalError::CapacityExhausted { limit, file_bytes } => write!(
+                f,
+                "capacità del journal esaurita: la transazione ha esteso il file fino a {file_bytes} byte, oltre {limit}; annullata senza pubblicare eventi"
+            ),
+            JournalError::RollbackFailed {
+                limit,
+                file_bytes,
+                detail,
+            } => write!(
+                f,
+                "capacità del journal esaurita ({file_bytes} byte oltre {limit}) e annullamento fallito: {detail}; riapertura necessaria"
+            ),
         }
     }
 }
@@ -419,6 +532,7 @@ pub struct JournalStats {
 pub struct Journal {
     db: Database,
     recovery_required: bool,
+    budget: JournalBudget,
     // Copia dell'handle verificato e consegnato al backend: la misura fisica
     // legge questo file, anche quando il percorso nominale non lo identifica
     // più. Nessuna operazione riapre il percorso.
@@ -450,6 +564,11 @@ impl Journal {
     /// La classificazione distingue prima esecuzione, bootstrap interrotto,
     /// journal esistente, schema futuro e corruzione; un file vuoto o
     /// illeggibile non viene mai azzerato.
+    ///
+    /// Il budget è [`JournalBudget::FIXTURE`]: [`Journal::with_budget`] lo
+    /// sostituisce prima delle scritture. Il budget non limita la dimensione
+    /// iniziale del file, che il bootstrap crea con il solo schema e nessun
+    /// evento; limita la crescita delle transazioni successive.
     pub fn open(root: impl Into<SharedRoot>) -> Result<(Journal, Startup), JournalError> {
         let root = root.into();
         let path = root.path().join(JOURNAL_FILE);
@@ -460,10 +579,20 @@ impl Journal {
             .verified_root()
             .open_existing_state_file(OsStr::new(JOURNAL_FILE), true)
         {
-            Ok(file) => Self::open_existing(root, claim, path, file),
-            Err(PlatformError::FileAbsent { .. }) => Self::bootstrap(root, claim),
+            Ok(file) => Self::open_existing(root, claim, path, file, JournalBudget::FIXTURE),
+            Err(PlatformError::FileAbsent { .. }) => {
+                Self::bootstrap(root, claim, JournalBudget::FIXTURE)
+            }
             Err(error) => Err(JournalError::Platform(error)),
         }
+    }
+
+    /// Sostituisce il budget dell'istanza senza toccare il file: le transazioni
+    /// successive applicano il nuovo limite. Un budget incoerente è rifiutato
+    /// prima di qualunque scrittura.
+    pub fn with_budget(mut self, budget: JournalBudget) -> Result<Self, JournalError> {
+        self.budget = budget.validate()?;
+        Ok(self)
     }
 
     fn open_existing(
@@ -471,6 +600,7 @@ impl Journal {
         claim: RootClaim,
         path: PathBuf,
         file: File,
+        budget: JournalBudget,
     ) -> Result<(Journal, Startup), JournalError> {
         let length = file
             .metadata()
@@ -515,7 +645,7 @@ impl Journal {
         let migrated_from = match observe(&db)? {
             Observation::Current => None,
             Observation::Legacy => {
-                migrate_legacy(&db, &path)?;
+                migrate_legacy(&db, &opened_file, &path, budget)?;
                 Some(LEGACY_SCHEMA_VERSION)
             }
         };
@@ -528,6 +658,7 @@ impl Journal {
             Journal {
                 db,
                 recovery_required: false,
+                budget,
                 opened_file,
                 path,
                 _claim: claim,
@@ -540,7 +671,11 @@ impl Journal {
         ))
     }
 
-    fn bootstrap(root: SharedRoot, claim: RootClaim) -> Result<(Journal, Startup), JournalError> {
+    fn bootstrap(
+        root: SharedRoot,
+        claim: RootClaim,
+        budget: JournalBudget,
+    ) -> Result<(Journal, Startup), JournalError> {
         let verified = root.verified_root();
         let residue = reserved_temporaries(verified)?;
         for name in &residue {
@@ -614,6 +749,7 @@ impl Journal {
             Journal {
                 db,
                 recovery_required: false,
+                budget,
                 opened_file,
                 path,
                 _claim: claim,
@@ -634,6 +770,13 @@ impl Journal {
     /// quello dell'evento precedente: un orologio che torna indietro non
     /// anticipa la retention. L'overflow della sequenza è verificato prima di
     /// qualunque scrittura, dentro la stessa transazione.
+    ///
+    /// La soglia è verificata su una transazione già aperta: se il batch ha
+    /// esteso il file oltre [`JournalBudget::append_limit`], Totum la annulla
+    /// esplicitamente. Solo se l'annullamento riesce l'esito è
+    /// [`JournalError::CapacityExhausted`], senza nuove sequenze né payload
+    /// visibili e con l'istanza ancora utilizzabile; un annullamento fallito è
+    /// [`JournalError::RollbackFailed`] e richiede la riapertura.
     pub fn append(
         &mut self,
         payloads: &[&[u8]],
@@ -660,6 +803,7 @@ impl Journal {
         {
             return Err(JournalError::InvalidBatch);
         }
+        let started = self.file_bytes()?;
         let tx = self.db.begin_write().map_err(storage)?;
         let (first, last) = {
             let mut meta = tx.open_table(META).map_err(storage)?;
@@ -684,6 +828,7 @@ impl Journal {
             meta.insert(META_INGESTED, ingested).map_err(storage)?;
             (first, last)
         };
+        let tx = self.guard_capacity(tx, self.budget.append_limit(), started)?;
         if let Err(error) = tx.commit() {
             self.recovery_required = true;
             return Err(JournalError::CommitOutcomeUnknown(error));
@@ -814,11 +959,15 @@ impl Journal {
     /// È l'unica operazione che cambia l'epoch. Le posizioni della generazione
     /// precedente vengono rifiutate con [`JournalError::EpochChanged`]; non
     /// esiste un reset automatico, una migrazione che cambia epoch o un
-    /// recupero che ne inventa una.
+    /// recupero che ne inventa una. Il reset può servirsi della riserva di
+    /// manutenzione fino a [`JournalBudget::max_file_bytes`]; se la supera, la
+    /// transazione già aperta viene annullata esplicitamente, con lo stesso
+    /// contratto di [`Journal::append`].
     pub fn reset(&mut self) -> Result<u64, JournalError> {
         if self.recovery_required {
             return Err(JournalError::RecoveryRequired);
         }
+        let started = self.file_bytes()?;
         let tx = self.db.begin_write().map_err(storage)?;
         let epoch = {
             let mut meta = tx.open_table(META).map_err(storage)?;
@@ -838,6 +987,7 @@ impl Journal {
             meta.insert(META_INGESTED, now_millis()).map_err(storage)?;
             epoch
         };
+        let tx = self.guard_capacity(tx, self.budget.max_file_bytes, started)?;
         checkpoint(Step::ResetBeforeCommit, &self.path)?;
         if let Err(error) = tx.commit() {
             self.recovery_required = true;
@@ -859,10 +1009,54 @@ impl Journal {
         if fault::measurement_failing() {
             return None;
         }
-        self.opened_file
-            .metadata()
-            .ok()
-            .map(|metadata| metadata.len())
+        self.file_bytes().ok()
+    }
+
+    /// Lunghezza effettiva del file aperto. A differenza della misura
+    /// diagnostica, il controllo del budget la richiede: se la lettura fallisce
+    /// la transazione non viene committata.
+    fn file_bytes(&self) -> Result<u64, JournalError> {
+        guard_file_size(&self.opened_file, &self.path)
+    }
+
+    /// Rifiuta la transazione ancora aperta se ha esteso il file oltre il limite.
+    ///
+    /// `started` è la lunghezza rilevata prima della transazione: una scrittura
+    /// che riusa spazio già allocato non estende il file e resta ammessa anche
+    /// quando la manutenzione lo ha portato oltre la soglia degli append. redb
+    /// non offre un controllo preventivo — estende il file mentre alloca le
+    /// pagine — quindi questa è l'unica verifica sul risultato reale.
+    ///
+    /// Quando la soglia scatta la transazione è già partita: viene annullata
+    /// esplicitamente con [`refuse_growth`]. L'istanza resta utilizzabile solo
+    /// se l'annullamento riesce; altrimenti `recovery_required` impone la
+    /// riapertura.
+    fn guard_capacity(
+        &mut self,
+        tx: WriteTransaction,
+        limit: u64,
+        started: u64,
+    ) -> Result<WriteTransaction, JournalError> {
+        let file_bytes = self.file_bytes()?;
+        if file_bytes <= limit || file_bytes <= started {
+            return Ok(tx);
+        }
+        let error = refuse_growth(tx, limit, file_bytes);
+        if matches!(error, JournalError::RollbackFailed { .. }) {
+            self.recovery_required = true;
+        }
+        Err(error)
+    }
+
+    /// Pagine allocate da redb in byte: nelle prove distingue lo spazio
+    /// riutilizzabile dal file ancora lungo. Non è una misura di prodotto.
+    #[cfg(test)]
+    fn allocated_bytes(&self) -> Result<u64, JournalError> {
+        let transaction = self.db.begin_write().map_err(storage)?;
+        let stats = transaction.stats().map_err(storage)?;
+        let bytes = stats.allocated_pages() * stats.page_size() as u64;
+        drop(transaction);
+        Ok(bytes)
     }
 }
 
@@ -1078,8 +1272,18 @@ fn check_legacy(db: &impl ReadableDatabase) -> Result<(), JournalError> {
 /// ingestione, quindi la migrazione assegna a tutti gli eventi conservati il
 /// proprio istante e introduce epoch, floor a zero e la tabella degli snapshot.
 /// Ogni evento mantiene la sequenza. Un errore di commit è un esito sconosciuto
-/// che richiede la riapertura, senza ritentativi automatici.
-fn migrate_legacy(db: &Database, path: &Path) -> Result<(), JournalError> {
+/// che richiede la riapertura, senza ritentativi automatici. La migrazione
+/// aggiunge i tempi e può estendere il file: vale il limite pieno, riserva di
+/// manutenzione compresa; superato il limite la transazione già aperta viene
+/// annullata esplicitamente, con [`JournalError::CapacityExhausted`] se riesce
+/// e [`JournalError::RollbackFailed`] se l'annullamento fallisce.
+fn migrate_legacy(
+    db: &Database,
+    file: &File,
+    path: &Path,
+    budget: JournalBudget,
+) -> Result<(), JournalError> {
+    let started = guard_file_size(file, path)?;
     let transaction = db.begin_write().map_err(storage)?;
     {
         let mut meta = transaction.open_table(META).map_err(storage)?;
@@ -1119,6 +1323,14 @@ fn migrate_legacy(db: &Database, path: &Path) -> Result<(), JournalError> {
             times.insert(sequence, ingested).map_err(storage)?;
         }
         transaction.open_table(SNAPSHOTS).map_err(storage)?;
+    }
+    let file_bytes = guard_file_size(file, path)?;
+    if file_bytes > budget.max_file_bytes && file_bytes > started {
+        return Err(refuse_growth(
+            transaction,
+            budget.max_file_bytes,
+            file_bytes,
+        ));
     }
     checkpoint(Step::MigrateBeforeCommit, path)?;
     if let Err(error) = transaction.commit() {
@@ -1185,6 +1397,42 @@ fn database(root: &SharedRoot, file: File, path: PathBuf) -> Result<Database, Jo
             redb::DatabaseError::DatabaseAlreadyOpen => JournalError::AlreadyOpen { path },
             error => storage(error),
         })
+}
+
+/// Annulla esplicitamente la transazione che ha esteso il file oltre il limite.
+///
+/// `CapacityExhausted` viene restituito soltanto se `abort` riesce: redb
+/// ripristina le allocazioni non pubblicate, quindi nessun nuovo evento,
+/// sequenza o metadato è visibile. Se `abort` fallisce lo stato del motore non è
+/// noto e `RollbackFailed` impone la riapertura. Una transazione realmente non
+/// annullabile non è producibile con redb: la prova ne simula l'esito.
+fn refuse_growth(tx: WriteTransaction, limit: u64, file_bytes: u64) -> JournalError {
+    #[cfg(test)]
+    if fault::abort_failing() {
+        drop(tx);
+        return JournalError::RollbackFailed {
+            limit,
+            file_bytes,
+            detail: "annullamento simulato non riuscito".to_owned(),
+        };
+    }
+    match tx.abort() {
+        Ok(()) => JournalError::CapacityExhausted { limit, file_bytes },
+        Err(error) => JournalError::RollbackFailed {
+            limit,
+            file_bytes,
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Lunghezza effettiva del file, letta dall'handle verificato: è la misura
+/// limitata dal budget, non lo spazio allocato dal filesystem né i byte dei
+/// payload.
+fn guard_file_size(file: &File, path: &Path) -> Result<u64, JournalError> {
+    file.metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| JournalError::Platform(PlatformError::io(path, error)))
 }
 
 fn finish_publication(root: &VerifiedRoot) -> Publication {
@@ -1344,6 +1592,7 @@ mod fault {
     thread_local! {
         static CRASH: Cell<Option<Step>> = const { Cell::new(None) };
         static MEASURE_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static ABORT_FAILURE: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) fn arm_crash(step: Step) {
@@ -1363,6 +1612,17 @@ mod fault {
 
     pub(super) fn measurement_failing() -> bool {
         MEASURE_FAILURE.with(Cell::get)
+    }
+
+    /// Sostituisce l'esito dell'annullamento del budget, che con redb reale non
+    /// fallisce: serve a verificare che un annullamento non riuscito richieda
+    /// la riapertura invece di dichiarare la capacità esaurita.
+    pub(super) fn fail_abort(failing: bool) {
+        ABORT_FAILURE.with(|flag| flag.set(failing));
+    }
+
+    pub(super) fn abort_failing() -> bool {
+        ABORT_FAILURE.with(Cell::get)
     }
 }
 

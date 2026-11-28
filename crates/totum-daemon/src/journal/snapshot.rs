@@ -75,11 +75,16 @@ impl Journal {
     /// gli eventi successivi fino all'ultima sequenza della stessa transazione.
     /// Senza uno snapshot precedente e con un prefisso già rimosso non esiste
     /// uno stato cumulativo ricostruibile: l'esito è un rifiuto, non uno
-    /// snapshot parziale.
+    /// snapshot parziale. Lo snapshot può usare la riserva di manutenzione
+    /// fino a [`JournalBudget::max_file_bytes`]; se la supera, la transazione
+    /// già aperta viene annullata esplicitamente e l'esito è
+    /// [`JournalError::CapacityExhausted`] soltanto se l'annullamento riesce,
+    /// altrimenti [`JournalError::RollbackFailed`] con riapertura obbligatoria.
     pub fn snapshot(&mut self) -> Result<Snapshot, JournalError> {
         if self.recovery_required {
             return Err(JournalError::RecoveryRequired);
         }
+        let started = self.file_bytes()?;
         let transaction = self.db.begin_write().map_err(storage)?;
         let snapshot = {
             let meta = transaction.open_table(META).map_err(storage)?;
@@ -122,6 +127,7 @@ impl Journal {
             trim_snapshots(&mut snapshots)?;
             snapshot
         };
+        let transaction = self.guard_capacity(transaction, self.budget.max_file_bytes, started)?;
         checkpoint(Step::SnapshotBeforeCommit, &self.path)?;
         if let Err(error) = transaction.commit() {
             self.recovery_required = true;

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use totum_daemon::config::{CoherenceInput, ComponentState, Store};
 use totum_daemon::journal::{
-    Event, JOURNAL_FILE, Journal, JournalError, Position, RetentionLimits, RetentionOutcome,
-    StartupKind,
+    Event, JOURNAL_FILE, Journal, JournalBudget, JournalError, Position, RetentionLimits,
+    RetentionOutcome, StartupKind,
 };
 use totum_daemon::platform::{self, LockedRoot, PlatformError, SharedRoot};
 
@@ -125,6 +125,21 @@ fn spawn_child(test: &str, dir: &Scratch) -> Reap {
             .spawn()
             .unwrap(),
     )
+}
+
+/// Esegue un test ignorato dello stesso binario come processo separato e ne
+/// attende l'uscita: serve alle riaperture dopo un rifiuto, dove il processo
+/// figlio deve terminare prima che il padre rilegga lo stato.
+fn run_child(test: &str, dir: &Scratch) -> std::process::ExitStatus {
+    let _forks = fork_window();
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", test])
+        .env("TOTUM_TEST_JOURNAL_ROOT", dir.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
 }
 
 /// Attende la barriera scritta dal figlio, senza attesa attiva sul lock.
@@ -422,6 +437,26 @@ fn journal_retention_child() {
 }
 
 #[test]
+#[ignore = "eseguito soltanto dal test padre"]
+fn journal_reopen_after_refusal_child() {
+    let Ok(root) = std::env::var("TOTUM_TEST_JOURNAL_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let locked = platform::lock(platform::prepare_root(root).unwrap()).unwrap();
+    let (mut journal, _) = Journal::open(locked).unwrap();
+    // L'abort del padre non ha lasciato traccia: lo stato è quello committato
+    // prima del batch rifiutato.
+    let stats = journal.statistics().unwrap();
+    assert_eq!(
+        (stats.floor, stats.high_water, stats.events),
+        (0, 2, 2),
+        "stato inatteso dopo il rifiuto"
+    );
+    assert_eq!(journal.append(&[b"child"]).unwrap(), 3..=3);
+}
+
+#[test]
 fn acknowledged_batch_survives_process_termination() {
     let dir = Scratch::new();
     let mut child = spawn_child("journal_crash_child", &dir);
@@ -480,6 +515,56 @@ fn the_retention_floor_survives_process_termination() {
         Err(JournalError::RetentionExpired { floor: 3, .. })
     ));
     assert_eq!(journal.append(&[b"four"]).unwrap(), 4..=4);
+}
+
+#[test]
+fn a_refused_append_leaves_the_committed_state_to_the_next_process() {
+    let dir = Scratch::new();
+    let (mut journal, _) = Journal::open(dir.lock()).unwrap();
+    let epoch = journal.epoch().unwrap();
+    assert_eq!(journal.append(&[b"one", b"two"]).unwrap(), 1..=2);
+    let bytes = journal.statistics().unwrap().physical_bytes.unwrap();
+
+    // Il limite coincide con il file attuale: il batch che deve crescere è
+    // rifiutato senza commit e la crescita non pubblicata è ripristinata.
+    let mut journal = journal
+        .with_budget(JournalBudget {
+            max_file_bytes: bytes + 1,
+            maintenance_reserve: 1,
+        })
+        .unwrap();
+    let payload = [0x11u8; 64 * 1024];
+    let batch = [payload.as_slice(); 16];
+    match journal.append(&batch).unwrap_err() {
+        JournalError::CapacityExhausted { limit, file_bytes } => {
+            assert_eq!(limit, bytes);
+            assert!(file_bytes > bytes);
+        }
+        other => panic!("esito inatteso: {other:?}"),
+    }
+    let stats = journal.statistics().unwrap();
+    assert_eq!(
+        (stats.epoch, stats.floor, stats.high_water, stats.events),
+        (epoch, 0, 2, 2)
+    );
+    assert_eq!(stats.physical_bytes, Some(bytes));
+    drop(journal);
+
+    let status = run_child("journal_reopen_after_refusal_child", &dir);
+    assert!(status.success(), "figlio fallito: {status:?}");
+
+    let (journal, _) = Journal::open(dir.lock()).unwrap();
+    let stats = journal.statistics().unwrap();
+    assert_eq!((stats.epoch, stats.floor, stats.high_water), (epoch, 0, 3));
+    assert_eq!(
+        journal
+            .read_after(0, 3)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]
